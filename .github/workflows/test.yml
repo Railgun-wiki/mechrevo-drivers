@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+    branches: [mechrevo-v4.22.3]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic python3
+      - name: Validate fan curves
+        run: python3 -m unittest discover -s tests -p 'test_fan_validation.py'
+      - name: Compile external kernel modules
+        run: |
+          headers="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"
+          test -n "$headers"
+          make -C "$headers" M="$GITHUB_WORKSPACE" -j2 modules
