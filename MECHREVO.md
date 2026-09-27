@@ -1,6 +1,6 @@
 # Mechrevo driver source
 
-This branch contains the complete tuxedo-drivers v4.22.3 source with OpenMechrevo patches 0001–0014 applied. The upstream `main` branch of this fork is left available to track tuxedocomputers/tuxedo-drivers.
+This branch contains the complete tuxedo-drivers v4.22.3 source with OpenMechrevo patches 0001–0015 applied. The upstream `main` branch of this fork is left available to track tuxedocomputers/tuxedo-drivers.
 
 The matching patch series, generated quirk source and packaging files live in OpenMechrevo's `kernel/` directory. The `submodules/tuxedo-drivers` gitlink pins this branch to the exact full-source commit; changes to kernel source should be exported to the patch series and checked against a clean upstream v4.22.3 replay before updating the gitlink.
 
