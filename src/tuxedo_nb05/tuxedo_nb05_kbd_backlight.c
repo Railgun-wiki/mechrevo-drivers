@@ -101,11 +101,6 @@ static int __init tuxedo_nb05_kbd_backlight_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(&pdev->dev, driver_data);
 
-	if (result) {
-		pr_err("Failed init write %d\n", result);
-		return result;
-	}
-
 	result = init_leds(pdev);
 	if (result)
 		return result;

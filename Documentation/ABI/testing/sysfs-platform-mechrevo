@@ -1,0 +1,129 @@
+What:		/sys/devices/platform/tuxedo_keyboard/perf_mode
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Platform performance mode selection. Reading returns the
+		current mode ("office", "gaming", "turbo", "custom", or "unknown").
+		Writing sets the mode register (EC 0x0751) and updates the
+		corresponding power LED indicators:
+		- "office": Power saving mode (EC 0xA0, LED mode 0)
+		- "gaming": Balanced / Gaming mode (EC 0x00, LED mode 1)
+		- "turbo": Maximum performance mode (EC 0x10, LED mode 2)
+		- "custom": User defined mode (EC 0x0726 bit 7 active, base mode at 0x0751)
+
+What:		/sys/devices/platform/tuxedo_keyboard/power_led_mode
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Direct control of the multi-color power LED indicator (EC 0x07A5).
+		Reading returns the current LED mode index (0..3).
+		Writing applies an atomic read-modify-write on bits 1:0 of the
+		status register while strictly preserving the silent (bit 2) and
+		over boost (bit 4) status bits.
+
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl_min
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl_max
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		AMD CPU Sustained Power Limit (SPL / PL1) in Watts.
+		Writing tdp_spl clamps the input value between tdp_spl_min
+		and tdp_spl_max and performs post-write readback verification
+		returning -EIO on failure.
+
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt_min
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt_max
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		AMD CPU Slow Package Power Tracking limit (sPPT / PL2) in Watts.
+		Writing clamps the value within [tdp_sppt_min, tdp_sppt_max]
+		and verifies written value against EC register.
+
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt_min
+What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt_max
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		AMD CPU Fast Package Power Tracking limit (fPPT / PL4) in Watts.
+		Writing clamps the value within [tdp_fppt_min, tdp_fppt_max]
+		and verifies written value against EC register. If PL4 double
+		flag (0x0727 bit 7) is enabled, value is scaled accordingly.
+
+What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset
+What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset_min
+What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset_max
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		CPU EC 0x0786: AMD models use an absolute target temperature
+		(degrees C); Intel models use degrees below TjMax (0..20).
+		Writing outside the model's min/max returns ERANGE instead of
+		clamping; bit 7 is asserted as the hardware enable flag.
+
+What:		/sys/devices/platform/tuxedo_keyboard/fan_curve1
+What:		/sys/devices/platform/tuxedo_keyboard/fan_curve2
+What:		/sys/devices/platform/tuxedo_keyboard/fan_curve3
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Raw 16-point logical fan table attributes. FanTable1p5 exposes its
+		CPU/GPU channels as fan_curve1/fan_curve2. FanTable2p0 exposes physical
+		fans 1/2/3; its separate GPU threshold blocks are preserved unchanged.
+		Fixed size: 48 bytes (16 points * 3 bytes).
+		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
+		Slot 15 down_temp aliases slot 14; both must agree. Writes require
+		strictly increasing active temperatures, a bounded hysteresis and a
+		high-temperature cooling point. The table is disabled while its CPU
+		threshold/duty bytes are written and read back; the previous bytes
+		and enable bits are restored on failure where EC access permits.
+		Successful writes assert 0x07C6 bit 2 and 0x07C5 bit 7.
+
+What:		/sys/devices/platform/tuxedo_keyboard/fan_boost
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Fan boost (full fan 100% speed) control via EC 0x0751 bit 6 (0x40).
+		Reading returns 1 if boost is active, 0 otherwise.
+		Writing 1 or 0 toggles bit 6 of EC performance register 0x0751.
+
+What:		/sys/devices/platform/tuxedo_keyboard/over_boost
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		OverBoost indicator status via EC 0x07A5 bit 4 (0x10).
+		Reading returns 1 if overboost is active, 0 otherwise.
+
+What:		/sys/devices/platform/tuxedo_keyboard/dgpu_power
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Discrete GPU PCIe slot power status and restricted restore control.
+		Reading calls ACPI AMW0.OEMG(0x0300, 2) and returns 1 if powered
+		(0xAA) or 0 if cut (0x55). Writing 1 may restore an already-cut
+		rail and verifies its status. Writing 0 while powered returns
+		EOPNOTSUPP: a safe OS eject / firmware _PSC handshake is not yet
+		established. The reboot-time display MUX is separate from this rail.
+
+What:		/sys/devices/platform/tuxedo_keyboard/mux_scheme
+Date:		September 2026
+KernelVersion:	6.1
+Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+Description:
+		Display MUX NVRAM variable scheme. Returns "amd" (0=MSHybrid, 1=dGPU,
+		2=iGPU), "intel" (4=MSHybrid, 2=dGPU, 1=iGPU), or "none" on platforms
+		without physical display MUX switching hardware. Automatically hidden
+		on motherboards without discrete graphics.

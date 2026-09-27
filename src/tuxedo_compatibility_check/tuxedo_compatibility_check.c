@@ -216,6 +216,25 @@ static const struct dmi_system_id tuxedo_dmi_string_match[] = {
 			DMI_MATCH(DMI_CHASSIS_VENDOR, "TUXEDO"),
 		},
 	},
+	/*
+	 * Allow Mechrevo devices sharing Tongfang/Uniwill ODM designs
+	 * to pass driver compatibility validation.
+	 */
+	{
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "MECHREVO"),
+		},
+	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "MECHREVO"),
+		},
+	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_CHASSIS_VENDOR, "MECHREVO"),
+		},
+	},
 	{ }
 };
 

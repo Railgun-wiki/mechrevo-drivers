@@ -95,10 +95,11 @@ static int lightbar_set_blocking(struct led_classdev *led_cdev, enum led_brightn
 	} else if (led_blue) {
 		ite8297_driver_data = container_of(led_cdev, struct ite8297_driver_data_t, cdev_blue);
 		ite8297_driver_data->current_color.blue = brightness;
+	} else {
+		return -EINVAL;
 	}
-	ite8297_write_state(ite8297_driver_data);
 
-	return 0;
+	return ite8297_write_state(ite8297_driver_data);
 }
 
 static enum led_brightness lightbar_get(struct led_classdev *led_cdev)

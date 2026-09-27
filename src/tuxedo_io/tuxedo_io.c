@@ -220,21 +220,29 @@ static void uw_id_tdp(void)
 	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS1XA05")) {
 		tdp_min_defs = tdp_min_gmxxgxx;
 		tdp_max_defs = tdp_max_gmxxgxx;
-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") &&
+	} else if ((dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") ||
+		    dmi_match(DMI_SYS_VENDOR, "MECHREVO")) &&
 		   dmi_match(DMI_BOARD_NAME, "GM6IXxB_MB1")) {
 		tdp_min_defs = tdp_min_gmxixxb_mb1;
 		tdp_max_defs = tdp_max_gmxixxb_mb1;
-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") &&
+	} else if ((dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") ||
+		    dmi_match(DMI_SYS_VENDOR, "MECHREVO")) &&
 		   dmi_match(DMI_BOARD_NAME, "GM6IXxB_MB2")) {
 		tdp_min_defs = tdp_min_gmxixxb_mb2;
 		tdp_max_defs = tdp_max_gmxixxb_mb2;
-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS17I06")) {
+	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS17I06") ||
+		   (dmi_match(DMI_SYS_VENDOR, "MECHREVO") &&
+		    dmi_match(DMI_BOARD_NAME, "GM6IXxB"))) {
 		tdp_min_defs = tdp_min_gmxixxn;
 		tdp_max_defs = tdp_max_gmxixxn;
-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15I06")) {
+	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15I06") ||
+		   dmi_match(DMI_BOARD_NAME, "GM5IXxA") ||
+		   dmi_match(DMI_BOARD_NAME, "GM5IX0A")) {
 		tdp_min_defs = tdp_min_gmxixxa;
 		tdp_max_defs = tdp_max_gmxixxa;
-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15A06")) {
+	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15A06")
+		   || dmi_match(DMI_BOARD_NAME, "GM5HG0A")
+		   || dmi_match(DMI_PRODUCT_NAME, "yilong15 Pro Series GM5HG0A")) {
 		tdp_min_defs = tdp_min_gmxhgxa;
 		tdp_max_defs = tdp_max_gmxhgxa;
 	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I07")) {

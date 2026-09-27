@@ -141,6 +141,8 @@ int uniwill_get_active_interface_id(char **id_str);
 #define UW_MODEL_PH4TQF		0x14
 #define UW_MODEL_PH4AQF_ARX	0x17
 
+struct uniwill_ec_regmap;
+
 struct uniwill_device_features_t {
 	u8 model;
 	/**
@@ -169,6 +171,8 @@ struct uniwill_device_features_t {
 	bool uniwill_has_usb_powershare;
 	bool uniwill_has_mini_led_local_dimming;
 	bool uniwill_has_hidden_bios_options;
+	/* Model-scoped register map indirection for address decoding */
+	const struct uniwill_ec_regmap *regmap;
 };
 
 struct uniwill_device_features_t *uniwill_get_device_features(void);
@@ -203,5 +207,6 @@ int set_full_fan_mode(bool enable);
 int uw_init_fan(void);
 u32 uw_set_fan(u32 fan_index, u8 fan_speed);
 u32 uw_set_fan_auto(void);
+int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out);
 
 #endif

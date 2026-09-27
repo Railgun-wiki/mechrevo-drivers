@@ -389,6 +389,46 @@ static const struct wmi_device_id uniwill_wmi_device_ids[] = {
 	{ }
 };
 
+/*
+ * Evaluate ACPI AMW0.OEMG method (WMI GUID BC method ID 4).
+ * Used for hardware subsystem controls including discrete GPU power switching
+ * and status queries (subsystem ID 0x0300).
+ */
+int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
+{
+	acpi_status status;
+	union acpi_object *out_acpi;
+	u8 in_buf[40];
+	u32 sub_le = cpu_to_le32(subsystem);
+	struct acpi_buffer wmi_in = { sizeof(in_buf), in_buf };
+	struct acpi_buffer wmi_out = { ACPI_ALLOCATE_BUFFER, NULL };
+	int ret = 0;
+
+	memset(in_buf, 0, sizeof(in_buf));
+	in_buf[0] = cmd;
+	memcpy(&in_buf[4], &sub_le, sizeof(sub_le));
+
+	mutex_lock(&uniwill_ec_lock);
+
+	status = wmi_evaluate_method(UNIWILL_WMI_MGMT_GUID_BC, 0, 4, &wmi_in, &wmi_out);
+	out_acpi = (union acpi_object *)wmi_out.pointer;
+
+	if (ACPI_FAILURE(status) || !out_acpi) {
+		pr_debug("uniwill_wmi: OEMG method evaluation failed\n");
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	if (status_out && out_acpi->type == ACPI_TYPE_BUFFER && out_acpi->buffer.length >= 1)
+		*status_out = out_acpi->buffer.pointer[0];
+
+out_unlock:
+	kfree(out_acpi);
+	mutex_unlock(&uniwill_ec_lock);
+	return ret;
+}
+EXPORT_SYMBOL(uniwill_wmi_oemg);
+
 static struct wmi_driver uniwill_wmi_driver = {
 	.driver = {
 		.name = UNIWILL_INTERFACE_WMI_STRID,
