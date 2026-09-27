@@ -2509,7 +2509,7 @@ static int uniwill_pprof_get(struct platform_profile_handler *pprof,
 		return ret;
 
 	if (custom) {
-		*profile = PLATFORM_PROFILE_CUSTOM;
+		*profile = PLATFORM_PROFILE_BALANCED;
 		return 0;
 	}
 
@@ -2556,13 +2556,6 @@ static int uniwill_pprof_set(struct platform_profile_handler *pprof,
 		mode = 0x10;
 		led = 2;
 		break;
-	case PLATFORM_PROFILE_CUSTOM:
-		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
-			return -EOPNOTSUPP;
-		mode = 0x00;
-		led = 1;
-		custom = true;
-		break;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -2571,7 +2564,6 @@ static int uniwill_pprof_set(struct platform_profile_handler *pprof,
 }
 
 static struct platform_profile_handler uniwill_pprof_handler = {
-	.name = "uniwill-mechrevo",
 	.profile_get = uniwill_pprof_get,
 	.profile_set = uniwill_pprof_set,
 };
@@ -2596,9 +2588,6 @@ static void uniwill_init_platform_profile(struct device *dev)
 	set_bit(PLATFORM_PROFILE_BALANCED, uniwill_pprof_handler.choices);
 	if (regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT)
 		set_bit(PLATFORM_PROFILE_PERFORMANCE, uniwill_pprof_handler.choices);
-	if (regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT)
-		set_bit(PLATFORM_PROFILE_CUSTOM, uniwill_pprof_handler.choices);
-	uniwill_pprof_handler.dev = dev;
 	if (platform_profile_register(&uniwill_pprof_handler))
 		pr_debug("platform_profile_register failed or already registered\n");
 #endif
@@ -2614,7 +2603,7 @@ static void uniwill_exit_platform_profile(struct device *dev)
 		uniwill_pprof_dev = NULL;
 	}
 #else
-	platform_profile_remove(&uniwill_pprof_handler);
+	platform_profile_remove();
 #endif
 #endif
 }
