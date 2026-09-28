@@ -1,0 +1,922 @@
+From 9801eaf869e9f08bc2478e3d47ef08433827af83 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 15:23:54 +0800
+Subject: [PATCH] uniwill: fix custom mode, fan table truncation, fan boost
+ mapping, and make dgpu_power read-only
+
+---
+ .../ABI/testing/sysfs-platform-mechrevo       |  37 +-
+ src/uniwill_keyboard.h                        | 339 ++++++++++++------
+ src/uniwill_mechrevo_quirks.h                 |  47 ++-
+ 3 files changed, 274 insertions(+), 149 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-platform-mechrevo b/Documentation/ABI/testing/sysfs-platform-mechrevo
+index 737ebec..1db2193 100644
+--- a/Documentation/ABI/testing/sysfs-platform-mechrevo
++++ b/Documentation/ABI/testing/sysfs-platform-mechrevo
+@@ -10,7 +10,7 @@ Description:
+ 		- "office": Power saving mode (EC 0xA0, LED mode 0)
+ 		- "gaming": Balanced / Gaming mode (EC 0x00, LED mode 1)
+ 		- "turbo": Maximum performance mode (EC 0x10, LED mode 2)
+-		- "custom": User defined mode (EC 0x20, LED mode 1)
++		- "custom": User defined mode (EC 0x0726 bit 7 active, base mode at 0x0751)
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/power_led_mode
+ Date:		September 2026
+@@ -21,7 +21,7 @@ Description:
+ 		Reading returns the current LED mode index (0..3).
+ 		Writing applies an atomic read-modify-write on bits 1:0 of the
+ 		status register while strictly preserving the silent (bit 2) and
+-		fan boost (bit 4) status bits.
++		over boost (bit 4) status bits.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl
+ What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl_min
+@@ -55,7 +55,8 @@ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+ 		AMD CPU Fast Package Power Tracking limit (fPPT / PL4) in Watts.
+ 		Writing clamps the value within [tdp_fppt_min, tdp_fppt_max]
+-		and verifies written value against EC register.
++		and verifies written value against EC register. If PL4 double
++		flag (0x0727 bit 7) is enabled, value is scaled accordingly.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset
+ What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset_min
+@@ -74,35 +75,41 @@ Date:		September 2026
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		[UNVERIFIED]: Raw 11-point hardware fan table binary attributes
+-		for CPU (fan_curve1) and GPU (fan_curve2) fan channels.
++		Raw 11-point hardware fan table binary attributes for CPU
++		(fan_curve1) and GPU (fan_curve2) fan channels (physical 16-slot table).
+ 		Fixed size: 33 bytes (11 points * 3 bytes).
+ 		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
+ 		Reading fetches live table from EC (0x0F00/0x0F30). Writing programs
+-		all 11 points directly into EC fan registers.
++		all 11 points and asserts RAM table enable (0x07C6 bit 2) and
++		respective dual-fan control (0x07C5 bit 7).
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_boost
+ Date:		September 2026
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		One-key fan boost (maximum speed) control.
++		Fan boost (full fan 100% speed) control via EC 0x0751 bit 6 (0x40).
+ 		Reading returns 1 if boost is active, 0 otherwise.
+-		Writing 1 or 0 toggles bit 4 of EC status register 0x07A5.
++		Writing 1 or 0 toggles bit 6 of EC performance register 0x0751.
++
++What:		/sys/devices/platform/tuxedo_keyboard/over_boost
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		OverBoost indicator status via EC 0x07A5 bit 4 (0x10).
++		Reading returns 1 if overboost is active, 0 otherwise.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/dgpu_power
+ Date:		September 2026
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		[UNVERIFIED: REBOOT PREFERRED]: Discrete GPU PCIe slot power control.
++		Discrete GPU PCIe slot power status (READ-ONLY).
+ 		Reading calls ACPI AMW0.OEMG(0x0300, 2) and returns 1 if powered
+-		(0xAA) or 0 if cut (0x55).
+-		Writing 0 invokes OEMG(0x0300, 1) cutting PCIe slot power; writing 1
+-		invokes OEMG(0x0300, 0) restoring power.
+-		WARNING: Userspace MUST unbind GPU kernel driver and remove the PCIe
+-		device before writing 0. On GM5HG0A platforms, switching graphics
+-		modes is designed to take effect after system reboot (via MUX NVRAM).
++		(0xAA) or 0 if cut (0x55). Dynamic power cut at runtime is disabled
++		to prevent PCIe Surprise Down AER kernel panic. Display switching
++		requires reboot via MUX NVRAM.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/mux_scheme
+ Date:		September 2026
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index e7e1b9b..a47963d 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2211,18 +2211,84 @@ static void uniwill_notify_platform_profile(void)
+ #endif
+ }
+ 
++static int uniwill_get_perf_mode_info(u8 *out_mode, bool *is_custom)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0, cflag = 0;
++	int ret;
++
++	if (is_custom) {
++		*is_custom = false;
++		if (uniwill_read_ec_ram(0x0726, &cflag) == 0 && (cflag & BIT(7)))
++			*is_custom = true;
++	}
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &val);
++	if (ret)
++		return ret;
++
++	if (out_mode)
++		*out_mode = val & 0xBF; /* Mask out bit 6 (FanBoost) */
++
++	return 0;
++}
++
++static int uniwill_set_perf_mode_info(u8 base_mode, u8 led_mode, bool custom)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 cur_perf = 0, cflag = 0, lflag = 0, led_val = 0;
++	int ret;
++
++	/* 1. Read current perf register to preserve bit 6 (FanBoost) */
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &cur_perf);
++	if (ret)
++		return ret;
++
++	cur_perf = (cur_perf & 0x40) | (base_mode & ~0x40);
++	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, cur_perf);
++	if (ret)
++		return ret;
++
++	/* 2. Configure custom flags in 0x0726 (bit 7) and 0x0727 (bit 6) */
++	if (uniwill_read_ec_ram(0x0726, &cflag) == 0) {
++		if (custom)
++			cflag |= BIT(7);
++		else
++			cflag &= ~BIT(7);
++		uniwill_write_ec_ram(0x0726, cflag);
++	}
++	if (uniwill_read_ec_ram(0x0727, &lflag) == 0) {
++		if (custom)
++			lflag |= BIT(6);
++		else
++			lflag &= ~BIT(6);
++		uniwill_write_ec_ram(0x0727, lflag);
++	}
++
++	/* 3. Synchronize power LED status bits 1:0 preserving other bits */
++	if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
++		led_val = (led_val & ~0x03) | (led_mode & 0x03);
++		uniwill_write_ec_ram(regmap->reg_power_led, led_val);
++	}
++
++	uniwill_notify_platform_profile();
++	return 0;
++}
++
+ static ssize_t perf_mode_show(struct device *dev,
+ 			      struct device_attribute *attr,
+ 			      char *buf)
+ {
+-	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode = 0;
+-	int ret;
++	bool custom = false;
++	int ret = uniwill_get_perf_mode_info(&mode, &custom);
+ 
+-	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
+ 	if (ret)
+ 		return ret;
+ 
++	if (custom)
++		return sysfs_emit(buf, "custom\n");
++
+ 	switch (mode) {
+ 	case 0xa0:
+ 		return sysfs_emit(buf, "office\n");
+@@ -2230,8 +2296,6 @@ static ssize_t perf_mode_show(struct device *dev,
+ 		return sysfs_emit(buf, "gaming\n");
+ 	case 0x10:
+ 		return sysfs_emit(buf, "turbo\n");
+-	case 0x20:
+-		return sysfs_emit(buf, "custom\n");
+ 	default:
+ 		return sysfs_emit(buf, "unknown\n");
+ 	}
+@@ -2243,6 +2307,7 @@ static ssize_t perf_mode_store(struct device *dev,
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode_val, led_mode;
++	bool custom = false;
+ 	char str[16];
+ 	int ret;
+ 
+@@ -2267,27 +2332,17 @@ static ssize_t perf_mode_store(struct device *dev,
+ 	} else if (sysfs_streq(str, "custom")) {
+ 		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
+ 			return -EOPNOTSUPP;
+-		mode_val = 0x20;
++		mode_val = 0x00;
+ 		led_mode = 1;
++		custom = true;
+ 	} else {
+ 		return -EINVAL;
+ 	}
+ 
+-	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, mode_val);
++	ret = uniwill_set_perf_mode_info(mode_val, led_mode, custom);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Synchronize power LED status bits 1:0 preserving other bits */
+-	{
+-		u8 led_val = 0;
+-
+-		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
+-			led_val = (led_val & ~0x03) | (led_mode & 0x03);
+-			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
+-		}
+-	}
+-
+-	uniwill_notify_platform_profile();
+ 	return count;
+ }
+ static DEVICE_ATTR_RW(perf_mode);
+@@ -2352,14 +2407,18 @@ static int uniwill_pprof_probe(void *drvdata, unsigned long *choices)
+ 
+ static int uniwill_pprof_get(struct device *dev, enum platform_profile_option *profile)
+ {
+-	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode = 0;
+-	int ret;
++	bool custom = false;
++	int ret = uniwill_get_perf_mode_info(&mode, &custom);
+ 
+-	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
+ 	if (ret)
+ 		return ret;
+ 
++	if (custom) {
++		*profile = PLATFORM_PROFILE_CUSTOM;
++		return 0;
++	}
++
+ 	switch (mode) {
+ 	case 0xa0:
+ 		*profile = PLATFORM_PROFILE_QUIET;
+@@ -2370,9 +2429,6 @@ static int uniwill_pprof_get(struct device *dev, enum platform_profile_option *p
+ 	case 0x10:
+ 		*profile = PLATFORM_PROFILE_PERFORMANCE;
+ 		break;
+-	case 0x20:
+-		*profile = PLATFORM_PROFILE_CUSTOM;
+-		break;
+ 	default:
+ 		*profile = PLATFORM_PROFILE_BALANCED;
+ 		break;
+@@ -2384,6 +2440,7 @@ static int uniwill_pprof_set(struct device *dev, enum platform_profile_option pr
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode, led;
++	bool custom = false;
+ 
+ 	switch (profile) {
+ 	case PLATFORM_PROFILE_QUIET:
+@@ -2407,23 +2464,15 @@ static int uniwill_pprof_set(struct device *dev, enum platform_profile_option pr
+ 	case PLATFORM_PROFILE_CUSTOM:
+ 		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
+ 			return -EOPNOTSUPP;
+-		mode = 0x20;
++		mode = 0x00;
+ 		led = 1;
++		custom = true;
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	uniwill_write_ec_ram(regmap->reg_perf_mode, mode);
+-	{
+-		u8 led_val = 0;
+-
+-		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
+-			led_val = (led_val & ~0x03) | (led & 0x03);
+-			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
+-		}
+-	}
+-	return 0;
++	return uniwill_set_perf_mode_info(mode, led, custom);
+ }
+ 
+ static const struct platform_profile_ops uniwill_pprof_ops = {
+@@ -2435,14 +2484,18 @@ static const struct platform_profile_ops uniwill_pprof_ops = {
+ static int uniwill_pprof_get(struct platform_profile_handler *pprof,
+ 			     enum platform_profile_option *profile)
+ {
+-	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode = 0;
+-	int ret;
++	bool custom = false;
++	int ret = uniwill_get_perf_mode_info(&mode, &custom);
+ 
+-	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
+ 	if (ret)
+ 		return ret;
+ 
++	if (custom) {
++		*profile = PLATFORM_PROFILE_CUSTOM;
++		return 0;
++	}
++
+ 	switch (mode) {
+ 	case 0xa0:
+ 		*profile = PLATFORM_PROFILE_QUIET;
+@@ -2453,9 +2506,6 @@ static int uniwill_pprof_get(struct platform_profile_handler *pprof,
+ 	case 0x10:
+ 		*profile = PLATFORM_PROFILE_PERFORMANCE;
+ 		break;
+-	case 0x20:
+-		*profile = PLATFORM_PROFILE_CUSTOM;
+-		break;
+ 	default:
+ 		*profile = PLATFORM_PROFILE_BALANCED;
+ 		break;
+@@ -2468,6 +2518,7 @@ static int uniwill_pprof_set(struct platform_profile_handler *pprof,
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 mode, led;
++	bool custom = false;
+ 
+ 	switch (profile) {
+ 	case PLATFORM_PROFILE_QUIET:
+@@ -2491,23 +2542,15 @@ static int uniwill_pprof_set(struct platform_profile_handler *pprof,
+ 	case PLATFORM_PROFILE_CUSTOM:
+ 		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
+ 			return -EOPNOTSUPP;
+-		mode = 0x20;
++		mode = 0x00;
+ 		led = 1;
++		custom = true;
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	uniwill_write_ec_ram(regmap->reg_perf_mode, mode);
+-	{
+-		u8 led_val = 0;
+-
+-		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
+-			led_val = (led_val & ~0x03) | (led & 0x03);
+-			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
+-		}
+-	}
+-	return 0;
++	return uniwill_set_perf_mode_info(mode, led, custom);
+ }
+ 
+ static struct platform_profile_handler uniwill_pprof_handler = {
+@@ -2680,10 +2723,15 @@ static ssize_t tdp_fppt_show(struct device *dev, struct device_attribute *attr,
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 val = 0;
++	bool double_pl4 = false;
+ 	int ret = uniwill_read_ec_ram(regmap->reg_tdp_fppt, &val);
+ 
+ 	if (ret)
+ 		return ret;
++
++	has_double_pl4(&double_pl4);
++	if (double_pl4)
++		return sysfs_emit(buf, "%u\n", (unsigned int)val * 2);
+ 	return sysfs_emit(buf, "%u\n", val);
+ }
+ 
+@@ -2692,19 +2740,26 @@ static ssize_t tdp_fppt_store(struct device *dev, struct device_attribute *attr,
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	unsigned int val;
+-	u8 readback = 0;
++	u8 write_val = 0, readback = 0;
++	bool double_pl4 = false;
+ 	int ret;
+ 
+ 	if (kstrtouint(buf, 0, &val))
+ 		return -EINVAL;
+ 
+ 	val = clamp_val(val, regmap->tdp_fppt_min, regmap->tdp_fppt_max);
+-	ret = uniwill_write_ec_ram(regmap->reg_tdp_fppt, (u8)val);
++	has_double_pl4(&double_pl4);
++	if (double_pl4)
++		write_val = (u8)(val / 2);
++	else
++		write_val = (u8)val;
++
++	ret = uniwill_write_ec_ram(regmap->reg_tdp_fppt, write_val);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = uniwill_read_ec_ram(regmap->reg_tdp_fppt, &readback);
+-	if (ret || readback != (u8)val)
++	if (ret || readback != write_val)
+ 		return -EIO;
+ 
+ 	return count;
+@@ -2853,14 +2908,9 @@ static ssize_t fan_curve1_read(struct file *filp, struct kobject *kobj,
+ 			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu + i - 1, &upt);
+ 		}
+ 
+-		/* DownT for point i is in EC offset i + 1; last point reads offset i */
+-		if (i < regmap->fan_points - 1) {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+-					    regmap->fan_down_temp_offset + i + 1, &downt);
+-		} else {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+-					    regmap->fan_down_temp_offset + i, &downt);
+-		}
++		/* DownT for point i is in EC offset i + 1 */
++		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
++				    regmap->fan_down_temp_offset + i + 1, &downt);
+ 
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+ 				    regmap->fan_duty_offset + i, &duty);
+@@ -2893,18 +2943,18 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 	if (off != 0 || count != total_size)
+ 		return -EINVAL;
+ 
+-	/* UpT: Points 1..10 written to offsets 0..9; rest clamped to 0xFF */
++	/* UpT: Points 1..regmap->fan_points-1 written to offsets 0..regmap->fan_points-2; rest clamped to 0xFF */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu + i, upt_val);
+ 	}
+ 
+-	/* DownT: Points 0..9 written to offsets 1..10; offset 0 set to 0 */
++	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 downt_val;
+ 		if (i == 0)
+ 			downt_val = 0;
+-		else if (i < regmap->fan_points)
++		else if (i <= regmap->fan_points)
+ 			downt_val = buf[(i - 1) * 3 + 1];
+ 		else
+ 			downt_val = 0xFF;
+@@ -2912,7 +2962,7 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 				     regmap->fan_down_temp_offset + i, downt_val);
+ 	}
+ 
+-	/* Duty: Points 0..10 scaled; rest clamped to 100 * scale */
++	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 duty_val;
+ 		if (i < regmap->fan_points) {
+@@ -2929,6 +2979,20 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 				     regmap->fan_duty_offset + i, duty_val);
+ 	}
+ 
++	/* Assert RAM fan table enable (0x07C6 bit 2) and respective control (0x07C5 bit 7) */
++	{
++		u8 en_val = 0;
++
++		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
++			en_val |= BIT(2);
++			uniwill_write_ec_ram(0x07C6, en_val);
++		}
++		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
++			en_val |= BIT(7);
++			uniwill_write_ec_ram(0x07C5, en_val);
++		}
++	}
++
+ 	return count;
+ }
+ 
+@@ -2969,14 +3033,9 @@ static ssize_t fan_curve2_read(struct file *filp, struct kobject *kobj,
+ 			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu + i - 1, &upt);
+ 		}
+ 
+-		/* DownT for point i is in EC offset i + 1; last point reads offset i */
+-		if (i < regmap->fan_points - 1) {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+-					    regmap->fan_down_temp_offset + i + 1, &downt);
+-		} else {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+-					    regmap->fan_down_temp_offset + i, &downt);
+-		}
++		/* DownT for point i is in EC offset i + 1 */
++		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
++				    regmap->fan_down_temp_offset + i + 1, &downt);
+ 
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+ 				    regmap->fan_duty_offset + i, &duty);
+@@ -3009,18 +3068,18 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 	if (off != 0 || count != total_size)
+ 		return -EINVAL;
+ 
+-	/* UpT: Points 1..10 written to offsets 0..9; rest clamped to 0xFF */
++	/* UpT: Points 1..regmap->fan_points-1 written to offsets 0..regmap->fan_points-2; rest clamped to 0xFF */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu + i, upt_val);
+ 	}
+ 
+-	/* DownT: Points 0..9 written to offsets 1..10; offset 0 set to 0 */
++	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 downt_val;
+ 		if (i == 0)
+ 			downt_val = 0;
+-		else if (i < regmap->fan_points)
++		else if (i <= regmap->fan_points)
+ 			downt_val = buf[(i - 1) * 3 + 1];
+ 		else
+ 			downt_val = 0xFF;
+@@ -3028,7 +3087,7 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 				     regmap->fan_down_temp_offset + i, downt_val);
+ 	}
+ 
+-	/* Duty: Points 0..10 scaled; rest clamped to 100 * scale */
++	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+ 	for (i = 0; i < 16; i++) {
+ 		u8 duty_val;
+ 		if (i < regmap->fan_points) {
+@@ -3045,6 +3104,20 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 				     regmap->fan_duty_offset + i, duty_val);
+ 	}
+ 
++	/* Assert RAM fan table enable (0x07C6 bit 2) and respective control (0x07C5 bit 7) */
++	{
++		u8 en_val = 0;
++
++		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
++			en_val |= BIT(2);
++			uniwill_write_ec_ram(0x07C6, en_val);
++		}
++		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
++			en_val |= BIT(7);
++			uniwill_write_ec_ram(0x07C5, en_val);
++		}
++	}
++
+ 	return count;
+ }
+ 
+@@ -3059,11 +3132,11 @@ static ssize_t fan_boost_show(struct device *dev, struct device_attribute *attr,
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u8 val = 0;
+-	int ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++	int ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &val);
+ 
+ 	if (ret)
+ 		return ret;
+-	return sysfs_emit(buf, "%u\n", !!(val & BIT(regmap->fan_boost_bit)));
++	return sysfs_emit(buf, "%u\n", !!(val & BIT(6)));
+ }
+ 
+ static ssize_t fan_boost_store(struct device *dev, struct device_attribute *attr,
+@@ -3074,6 +3147,49 @@ static ssize_t fan_boost_store(struct device *dev, struct device_attribute *attr
+ 	u8 val = 0, readback = 0;
+ 	int ret;
+ 
++	if (kstrtobool(buf, &enable))
++		return -EINVAL;
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &val);
++	if (ret)
++		return ret;
++
++	if (enable)
++		val |= BIT(6);
++	else
++		val &= ~BIT(6);
++
++	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &readback);
++	if (ret || !!(readback & BIT(6)) != enable)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(fan_boost);
++
++static ssize_t over_boost_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", !!(val & BIT(4)));
++}
++
++static ssize_t over_boost_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	bool enable;
++	u8 val = 0, readback = 0;
++	int ret;
++
+ 	if (kstrtobool(buf, &enable))
+ 		return -EINVAL;
+ 
+@@ -3082,21 +3198,21 @@ static ssize_t fan_boost_store(struct device *dev, struct device_attribute *attr
+ 		return ret;
+ 
+ 	if (enable)
+-		val |= BIT(regmap->fan_boost_bit);
++		val |= BIT(4);
+ 	else
+-		val &= ~BIT(regmap->fan_boost_bit);
++		val &= ~BIT(4);
+ 
+ 	ret = uniwill_write_ec_ram(regmap->reg_power_led, val);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = uniwill_read_ec_ram(regmap->reg_power_led, &readback);
+-	if (ret || !!(readback & BIT(regmap->fan_boost_bit)) != enable)
++	if (ret || !!(readback & BIT(4)) != enable)
+ 		return -EIO;
+ 
+ 	return count;
+ }
+-static DEVICE_ATTR_RW(fan_boost);
++static DEVICE_ATTR_RW(over_boost);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+ static const struct bin_attribute *const uniwill_fan_bin_attrs[] = {
+@@ -3114,6 +3230,7 @@ static struct bin_attribute *uniwill_fan_bin_attrs[] = {
+ 
+ static struct attribute *uniwill_fan_attrs[] = {
+ 	&dev_attr_fan_boost.attr,
++	&dev_attr_over_boost.attr,
+ 	NULL,
+ };
+ 
+@@ -3135,13 +3252,13 @@ static const struct attribute_group uniwill_fan_attr_group = {
+ };
+ 
+ /*
+- * Discrete GPU power rail control via ACPI AMW0.OEMG(0x0300).
++ * Discrete GPU power rail status via ACPI AMW0.OEMG(0x0300).
+  *
+- * [UNVERIFIED: REBOOT PREFERRED]
+- * On GM5HG0A and compatible platforms, switching graphics modes is designed
+- * to take effect after system reboot (via MUX NVRAM). Runtime dynamic power
+- * cut requires user space to explicitly unbind the GPU driver and remove the
+- * PCIe device first; otherwise CPU PCIe AER fatal errors or bus hangs may occur.
++ * NOTE: Dynamic runtime power cutting without prior PCIe bus unbind and ACPI
++ * eject causes fatal PCIe Surprise Down AER kernel panic.
++ * Switching GPU display modes must be performed via UEFI MUX NVRAM variable
++ * and takes effect after system reboot.
++ * The dgpu_power attribute is strictly READ-ONLY (query status only).
+  */
+ 
+ static ssize_t dgpu_power_show(struct device *dev,
+@@ -3164,27 +3281,7 @@ static ssize_t dgpu_power_show(struct device *dev,
+ 
+ 	return sysfs_emit(buf, "unknown (0x%02x)\n", status);
+ }
+-
+-static ssize_t dgpu_power_store(struct device *dev,
+-				struct device_attribute *attr,
+-				const char *buf, size_t count)
+-{
+-	bool power_on;
+-	u8 cmd;
+-	int ret;
+-
+-	if (kstrtobool(buf, &power_on))
+-		return -EINVAL;
+-
+-	/* cmd=1 cuts PCIe slot power (IGPS(1)), cmd=0 restores power (IGPS(0)) */
+-	cmd = power_on ? 0 : 1;
+-	ret = uniwill_wmi_oemg(cmd, 0x0300, NULL);
+-	if (ret)
+-		return ret;
+-
+-	return count;
+-}
+-static DEVICE_ATTR_RW(dgpu_power);
++static DEVICE_ATTR_RO(dgpu_power);
+ 
+ static ssize_t mux_scheme_show(struct device *dev,
+ 			       struct device_attribute *attr,
+@@ -3237,6 +3334,7 @@ static const struct attribute_group uniwill_dgpu_attr_group = {
+ 
+ static int uniwill_keyboard_probe(struct platform_device *dev)
+ {
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	u32 i;
+ 	u8 data;
+ 	int status;
+@@ -3248,15 +3346,14 @@ static int uniwill_keyboard_probe(struct platform_device *dev)
+ 
+ 	/* Initialize performance mode register only if unset or invalid */
+ 	{
+-		const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 		u8 cur_mode = 0;
+ 
+ 		if (uniwill_read_ec_ram(regmap->reg_perf_mode, &cur_mode) != 0 ||
+-		    (cur_mode != 0xa0 && cur_mode != 0x00 && cur_mode != 0x10 && cur_mode != 0x20))
++		    ((cur_mode & 0xBF) != 0xa0 && (cur_mode & 0xBF) != 0x00 && (cur_mode & 0xBF) != 0x10))
+ 			uniwill_write_ec_ram(regmap->reg_perf_mode, 0x00);
+ 	}
+ 
+-	if (uw_feats->uniwill_profile_v1) {
++	if (uw_feats->uniwill_profile_v1 && (!regmap || !regmap->has_fan_table)) {
+ 		// Set manual-mode fan-curve in 0x0743 - 0x0747
+ 		// Some kind of default fan-curve is stored in 0x0786 - 0x078a: Using it to initialize manual-mode fan-curve
+ 		for (i = 0; i < 5; ++i) {
+@@ -3269,8 +3366,9 @@ static int uniwill_keyboard_probe(struct platform_device *dev)
+ 	// custom profile mode flag to ID this set of devices.
+ 	uniwill_set_custom_profile_mode(true);
+ 
+-	// Enable manual mode
+-	uniwill_write_ec_ram(0x0741, 0x01);
++	// Enable manual mode for legacy platforms only
++	if (!regmap || !regmap->has_fan_table)
++		uniwill_write_ec_ram(0x0741, 0x01);
+ 
+ 	// Zero second fan temp for detection
+ 	uniwill_write_ec_ram(0x044f, 0x00);
+@@ -3327,6 +3425,8 @@ static int uniwill_keyboard_remove(struct platform_device *dev)
+ static void uniwill_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
+ 	uniwill_exit_platform_profile(&dev->dev);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_dgpu_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_fan_attr_group);
+@@ -3351,8 +3451,9 @@ static void uniwill_keyboard_remove(struct platform_device *dev)
+ 	if (uw_lightbar_loaded)
+ 		uw_lightbar_remove(dev);
+ 
+-	// Disable manual mode
+-	uniwill_write_ec_ram(0x0741, 0x00);
++	// Disable manual mode for legacy platforms only
++	if (!regmap || !regmap->has_fan_table)
++		uniwill_write_ec_ram(0x0741, 0x00);
+ 
+ 	// Ignore return value, it just means this filter was not active atm.
+ 	if (i8042_remove_filter(uniwill_i8042_filter))
+diff --git a/src/uniwill_mechrevo_quirks.h b/src/uniwill_mechrevo_quirks.h
+index 7bee7d5..5079b0b 100644
+--- a/src/uniwill_mechrevo_quirks.h
++++ b/src/uniwill_mechrevo_quirks.h
+@@ -95,7 +95,7 @@ static const struct uniwill_ec_regmap default_uniwill_regmap = {
+ 	.fan_down_temp_offset = 0,
+ 	.fan_duty_offset = 0,
+ 	.fan_duty_scale = 0,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 5,
+ 	.tdp_spl_max = 45,
+@@ -132,7 +132,7 @@ static const struct uniwill_ec_regmap generic_uniwill_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 5,
+ 	.tdp_spl_max = 45,
+@@ -156,7 +156,7 @@ static const struct uniwill_ec_regmap gm5hg0a_regmap = {
+ 	.has_dgpu_power_cut = 1,
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+-	.fan_points = 11,
++	.fan_points = 16,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -169,7 +169,7 @@ static const struct uniwill_ec_regmap gm5hg0a_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 5,
+ 	.tdp_spl_max = 90,
+@@ -193,7 +193,7 @@ static const struct uniwill_ec_regmap gm5ixxa_regmap = {
+ 	.has_dgpu_power_cut = 1,
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+-	.fan_points = 11,
++	.fan_points = 16,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -206,7 +206,7 @@ static const struct uniwill_ec_regmap gm5ixxa_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 25,
+ 	.tdp_spl_max = 140,
+@@ -230,7 +230,7 @@ static const struct uniwill_ec_regmap gm6ixxb_regmap = {
+ 	.has_dgpu_power_cut = 1,
+ 	.has_fan_table = 1,
+ 	.fan_channels = 3,
+-	.fan_points = 11,
++	.fan_points = 16,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -243,7 +243,7 @@ static const struct uniwill_ec_regmap gm6ixxb_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 25,
+ 	.tdp_spl_max = 140,
+@@ -267,7 +267,7 @@ static const struct uniwill_ec_regmap gmxrgxx_regmap = {
+ 	.has_dgpu_power_cut = 1,
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+-	.fan_points = 11,
++	.fan_points = 16,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -280,7 +280,7 @@ static const struct uniwill_ec_regmap gmxrgxx_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 5,
+ 	.tdp_spl_max = 90,
+@@ -317,7 +317,7 @@ static const struct uniwill_ec_regmap unsupported_non_tongfang_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 0,
+ 	.tdp_spl_max = 0,
+@@ -354,7 +354,7 @@ static const struct uniwill_ec_regmap wujie14p_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
+-	.fan_boost_bit = 4,
++	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 15,
+ 	.tdp_spl_max = 54,
+@@ -383,7 +383,6 @@ static const struct uniwill_dmi_regmap_entry uniwill_dmi_regmap_table[] = {
+ 	{ "MECHREVO", "GM5HG", NULL, &gm5hg0a_regmap },
+ 	{ "MECHREVO", NULL, "yilong15", &gm5hg0a_regmap },
+ 	{ "MECHREVO", NULL, "STELLSL15A06", &gm5hg0a_regmap },
+-	{ "MECHREVO", NULL, "0001", &gm5hg0a_regmap },
+ 	{ "MECHREVO", "GM5IX", NULL, &gm5ixxa_regmap },
+ 	{ "MECHREVO", NULL, "STELLSL15I06", &gm5ixxa_regmap },
+ 	{ "MECHREVO", NULL, "yilong15i", &gm5ixxa_regmap },
+@@ -418,7 +417,10 @@ static inline const struct uniwill_ec_regmap *uniwill_match_ec_regmap(void)
+ 	    (board_vendor && strstr(board_vendor, "MECHREVO")))
+ 		is_mechrevo = true;
+ 
++	/* Pass 1: Strict board_name match (highest priority) */
+ 	for (entry = uniwill_dmi_regmap_table; entry->regmap != NULL; entry++) {
++		if (!entry->board_name)
++			continue;
+ 		if (entry->vendor) {
+ 			bool vendor_match = false;
+ 			if (sys_vendor && strstr(sys_vendor, entry->vendor))
+@@ -428,9 +430,24 @@ static inline const struct uniwill_ec_regmap *uniwill_match_ec_regmap(void)
+ 			if (!vendor_match)
+ 				continue;
+ 		}
+-		if (entry->board_name && board_name && strstr(board_name, entry->board_name))
++		if (board_name && strstr(board_name, entry->board_name))
+ 			return entry->regmap;
+-		if (entry->product_name && product_name && strstr(product_name, entry->product_name))
++	}
++
++	/* Pass 2: Secondary product_name match */
++	for (entry = uniwill_dmi_regmap_table; entry->regmap != NULL; entry++) {
++		if (!entry->product_name)
++			continue;
++		if (entry->vendor) {
++			bool vendor_match = false;
++			if (sys_vendor && strstr(sys_vendor, entry->vendor))
++				vendor_match = true;
++			if (board_vendor && strstr(board_vendor, entry->vendor))
++				vendor_match = true;
++			if (!vendor_match)
++				continue;
++		}
++		if (product_name && strstr(product_name, entry->product_name))
+ 			return entry->regmap;
+ 	}
+ 

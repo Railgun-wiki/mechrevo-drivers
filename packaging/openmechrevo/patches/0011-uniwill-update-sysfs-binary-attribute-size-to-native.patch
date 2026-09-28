@@ -1,0 +1,53 @@
+From dd899243b8e04eb7e19b1ae3c20ea2e9978b8cc5 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 15:55:39 +0800
+Subject: [PATCH] uniwill: update sysfs binary attribute size to native 48
+ bytes (16-point)
+
+---
+ Documentation/ABI/testing/sysfs-platform-mechrevo | 6 +++---
+ src/uniwill_keyboard.h                            | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-platform-mechrevo b/Documentation/ABI/testing/sysfs-platform-mechrevo
+index 1db2193..c3ad6e1 100644
+--- a/Documentation/ABI/testing/sysfs-platform-mechrevo
++++ b/Documentation/ABI/testing/sysfs-platform-mechrevo
+@@ -75,12 +75,12 @@ Date:		September 2026
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		Raw 11-point hardware fan table binary attributes for CPU
++		Raw 16-point hardware fan table binary attributes for CPU
+ 		(fan_curve1) and GPU (fan_curve2) fan channels (physical 16-slot table).
+-		Fixed size: 33 bytes (11 points * 3 bytes).
++		Fixed size: 48 bytes (16 points * 3 bytes).
+ 		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
+ 		Reading fetches live table from EC (0x0F00/0x0F30). Writing programs
+-		all 11 points and asserts RAM table enable (0x07C6 bit 2) and
++		all 16 slots and asserts RAM table enable (0x07C6 bit 2) and
+ 		respective dual-fan control (0x07C5 bit 7).
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_boost
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index d8f9113..ec2254b 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2999,7 +2999,7 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 
+ static struct bin_attribute bin_attr_fan_curve1 = {
+ 	.attr = { .name = "fan_curve1", .mode = 0644 },
+-	.size = 33,
++	.size = 48,
+ 	.read = fan_curve1_read,
+ 	.write = fan_curve1_write,
+ };
+@@ -3125,7 +3125,7 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 
+ static struct bin_attribute bin_attr_fan_curve2 = {
+ 	.attr = { .name = "fan_curve2", .mode = 0644 },
+-	.size = 33,
++	.size = 48,
+ 	.read = fan_curve2_read,
+ 	.write = fan_curve2_write,
+ };

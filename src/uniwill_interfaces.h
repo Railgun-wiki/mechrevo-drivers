@@ -124,6 +124,7 @@ struct uniwill_interface_t {
 	uniwill_read_ec_ram_t *read_ec_ram;
 	uniwill_write_ec_ram_t *write_ec_ram;
 	uniwill_wmi_evaluate_t *wmi_evaluate;
+	int (*wmi_oemg)(u8 cmd, u32 subsystem, u8 *status_out);
 };
 
 int uniwill_add_interface(struct uniwill_interface_t *new_interface);

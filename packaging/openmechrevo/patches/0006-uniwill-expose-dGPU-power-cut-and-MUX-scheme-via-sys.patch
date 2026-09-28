@@ -1,0 +1,214 @@
+From 365880d1f0c5285f7946ae6f324b3fb8af62f33a Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 16:29:20 +0800
+Subject: [PATCH] uniwill: expose dGPU power cut and MUX scheme via sysfs
+
+Implement uniwill_wmi_oemg() in uniwill_wmi to evaluate ACPI AMW0.OEMG
+method (WMI GUID BC, method ID 4).
+
+Expose sysfs attributes dgpu_power (rw) and mux_scheme (ro) under the
+tuxedo_keyboard device. The attributes are conditionally visible via
+.is_visible only on motherboards whose regmap flags dGPU presence and
+power cut or MUX capability, safely hiding them on iGPU-only platforms.
+
+Reading dgpu_power invokes OEMG(subsystem 0x0300, cmd 2), decoding 0x55
+(power cut) to "0
+" and 0xAA (power active) to "1
+". Writing 0 triggers
+power cut (cmd 1) and writing 1 triggers power restoration (cmd 0).
+
+[UNVERIFIED: REBOOT PREFERRED]: On GM5HG0A and compatible platforms,
+official firmware design treats graphics mode switching as taking effect
+upon reboot via UEFI NVRAM (MUX). Dynamic runtime power cutting requires
+user space to unbind the GPU driver and remove the PCIe device beforehand
+to avoid PCIe fatal bus hangs or kernel panics.
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ src/uniwill_interfaces.h |   1 +
+ src/uniwill_keyboard.h   | 102 +++++++++++++++++++++++++++++++++++++++
+ src/uniwill_wmi.c        |  40 +++++++++++++++
+ 3 files changed, 143 insertions(+)
+
+diff --git a/src/uniwill_interfaces.h b/src/uniwill_interfaces.h
+index ed88134..de4bb10 100644
+--- a/src/uniwill_interfaces.h
++++ b/src/uniwill_interfaces.h
+@@ -207,5 +207,6 @@ int set_full_fan_mode(bool enable);
+ int uw_init_fan(void);
+ u32 uw_set_fan(u32 fan_index, u8 fan_speed);
+ u32 uw_set_fan_auto(void);
++int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out);
+ 
+ #endif
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index 7b59014..e7e1b9b 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -3134,6 +3134,107 @@ static const struct attribute_group uniwill_fan_attr_group = {
+ 	.is_bin_visible = uniwill_fan_bin_attr_is_visible,
+ };
+ 
++/*
++ * Discrete GPU power rail control via ACPI AMW0.OEMG(0x0300).
++ *
++ * [UNVERIFIED: REBOOT PREFERRED]
++ * On GM5HG0A and compatible platforms, switching graphics modes is designed
++ * to take effect after system reboot (via MUX NVRAM). Runtime dynamic power
++ * cut requires user space to explicitly unbind the GPU driver and remove the
++ * PCIe device first; otherwise CPU PCIe AER fatal errors or bus hangs may occur.
++ */
++
++static ssize_t dgpu_power_show(struct device *dev,
++			       struct device_attribute *attr,
++			       char *buf)
++{
++	u8 status = 0;
++	int ret;
++
++	/* Query power status: cmd=2, subsystem=0x0300 */
++	ret = uniwill_wmi_oemg(2, 0x0300, &status);
++	if (ret)
++		return ret;
++
++	/* 0x55 indicates power cut / isolated, 0xAA indicates power active */
++	if (status == 0x55)
++		return sysfs_emit(buf, "0\n");
++	else if (status == 0xaa)
++		return sysfs_emit(buf, "1\n");
++
++	return sysfs_emit(buf, "unknown (0x%02x)\n", status);
++}
++
++static ssize_t dgpu_power_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	bool power_on;
++	u8 cmd;
++	int ret;
++
++	if (kstrtobool(buf, &power_on))
++		return -EINVAL;
++
++	/* cmd=1 cuts PCIe slot power (IGPS(1)), cmd=0 restores power (IGPS(0)) */
++	cmd = power_on ? 0 : 1;
++	ret = uniwill_wmi_oemg(cmd, 0x0300, NULL);
++	if (ret)
++		return ret;
++
++	return count;
++}
++static DEVICE_ATTR_RW(dgpu_power);
++
++static ssize_t mux_scheme_show(struct device *dev,
++			       struct device_attribute *attr,
++			       char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	if (!regmap || !regmap->has_mux)
++		return sysfs_emit(buf, "none\n");
++
++	switch (regmap->mux_scheme) {
++	case UNIWILL_MUX_AMD:
++		return sysfs_emit(buf, "amd\n");
++	case UNIWILL_MUX_INTEL:
++		return sysfs_emit(buf, "intel\n");
++	default:
++		return sysfs_emit(buf, "none\n");
++	}
++}
++static DEVICE_ATTR_RO(mux_scheme);
++
++static struct attribute *uniwill_dgpu_attrs[] = {
++	&dev_attr_dgpu_power.attr,
++	&dev_attr_mux_scheme.attr,
++	NULL,
++};
++
++static umode_t uniwill_dgpu_attr_is_visible(struct kobject *kobj,
++					    struct attribute *attr,
++					    int n)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	if (!regmap || !regmap->has_dgpu)
++		return 0;
++
++	if (attr == &dev_attr_dgpu_power.attr && !regmap->has_dgpu_power_cut)
++		return 0;
++
++	if (attr == &dev_attr_mux_scheme.attr && !regmap->has_mux)
++		return 0;
++
++	return attr->mode;
++}
++
++static const struct attribute_group uniwill_dgpu_attr_group = {
++	.attrs = uniwill_dgpu_attrs,
++	.is_visible = uniwill_dgpu_attr_is_visible,
++};
++
+ static int uniwill_keyboard_probe(struct platform_device *dev)
+ {
+ 	u32 i;
+@@ -3227,6 +3328,7 @@ static void uniwill_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
+ 	uniwill_exit_platform_profile(&dev->dev);
++	sysfs_remove_group(&dev->dev.kobj, &uniwill_dgpu_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_fan_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_tdp_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_perf_attr_group);
+diff --git a/src/uniwill_wmi.c b/src/uniwill_wmi.c
+index ff1b93f..a9a2507 100644
+--- a/src/uniwill_wmi.c
++++ b/src/uniwill_wmi.c
+@@ -389,6 +389,46 @@ static const struct wmi_device_id uniwill_wmi_device_ids[] = {
+ 	{ }
+ };
+ 
++/*
++ * Evaluate ACPI AMW0.OEMG method (WMI GUID BC method ID 4).
++ * Used for hardware subsystem controls including discrete GPU power switching
++ * and status queries (subsystem ID 0x0300).
++ */
++int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
++{
++	acpi_status status;
++	union acpi_object *out_acpi;
++	u8 in_buf[40];
++	u32 sub_le = cpu_to_le32(subsystem);
++	struct acpi_buffer wmi_in = { sizeof(in_buf), in_buf };
++	struct acpi_buffer wmi_out = { ACPI_ALLOCATE_BUFFER, NULL };
++	int ret = 0;
++
++	memset(in_buf, 0, sizeof(in_buf));
++	in_buf[0] = cmd;
++	memcpy(&in_buf[4], &sub_le, sizeof(sub_le));
++
++	mutex_lock(&uniwill_ec_lock);
++
++	status = wmi_evaluate_method(UNIWILL_WMI_MGMT_GUID_BC, 0, 4, &wmi_in, &wmi_out);
++	out_acpi = (union acpi_object *)wmi_out.pointer;
++
++	if (ACPI_FAILURE(status) || !out_acpi) {
++		pr_debug("uniwill_wmi: OEMG method evaluation failed\n");
++		ret = -EIO;
++		goto out_unlock;
++	}
++
++	if (status_out && out_acpi->type == ACPI_TYPE_BUFFER && out_acpi->buffer.length >= 1)
++		*status_out = out_acpi->buffer.pointer[0];
++
++out_unlock:
++	kfree(out_acpi);
++	mutex_unlock(&uniwill_ec_lock);
++	return ret;
++}
++EXPORT_SYMBOL(uniwill_wmi_oemg);
++
+ static struct wmi_driver uniwill_wmi_driver = {
+ 	.driver = {
+ 		.name = UNIWILL_INTERFACE_WMI_STRID,

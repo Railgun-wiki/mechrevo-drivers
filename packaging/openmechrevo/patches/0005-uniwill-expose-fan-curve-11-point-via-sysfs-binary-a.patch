@@ -1,0 +1,365 @@
+From d64fd7f0383df96e0a2221d4be88261be191f66a Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 00:36:25 +0800
+Subject: [PATCH] uniwill: expose fan curve (11-point) via sysfs binary
+ attribute
+
+Expose 33-byte binary sysfs attributes fan_curve1 and fan_curve2
+under tuxedo_keyboard device node to allow reading and writing
+11-point fan curve tables directly to EC RAM on supported hardware.
+
+Align EC RAM offsets with official FanTable1p5 specifications:
+- UpT: points 1..10 written to offsets 0..9 with 0xFF saturation,
+  point 0 UpT is implicitly 0 C flat base.
+- DownT: points 0..9 written to offsets 1..10 with offset 0 as 0.
+- Duty: points 0..10 scaled by fan_duty_scale (e.g. 2x for percentage).
+
+Also expose fan_boost sysfs attribute (0/1) for toggling maximum fan speed.
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ src/uniwill_keyboard.h | 324 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 324 insertions(+)
+
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index bb2819d..7b59014 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2811,6 +2811,329 @@ static const struct attribute_group uniwill_tdp_attr_group = {
+ 	.is_visible = uniwill_tdp_attr_is_visible,
+ };
+ 
++/*
++ * 11-point hardware fan curve tables and fan boost control.
++ * [UNVERIFIED]: Writes 11 temperature/duty triplets directly into EC fan tables.
++ * Kernel exposes down/upload primitives only; curves are driven by userspace.
++ */
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++#define UW_BIN_ATTR_ARG const struct bin_attribute *
++#else
++#define UW_BIN_ATTR_ARG struct bin_attribute *
++#endif
++
++static ssize_t fan_curve1_read(struct file *filp, struct kobject *kobj,
++			       UW_BIN_ATTR_ARG bin_attr,
++			       char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off >= total_size)
++		return 0;
++	if (off + count > total_size)
++		count = total_size - off;
++
++	for (i = 0; i < regmap->fan_points; i++) {
++		u8 upt = 0, downt = 0, duty = 0;
++
++		if (i * 3 + 2 < off || i * 3 >= off + count)
++			continue;
++
++		/* Point 0 UpT is 0 C base; points 1..10 read from offsets 0..9 */
++		if (i == 0) {
++			upt = 0;
++		} else {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu + i - 1, &upt);
++		}
++
++		/* DownT for point i is in EC offset i + 1; last point reads offset i */
++		if (i < regmap->fan_points - 1) {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
++					    regmap->fan_down_temp_offset + i + 1, &downt);
++		} else {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
++					    regmap->fan_down_temp_offset + i, &downt);
++		}
++
++		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
++				    regmap->fan_duty_offset + i, &duty);
++		if (regmap->fan_duty_scale)
++			duty /= regmap->fan_duty_scale;
++
++		if (i * 3 >= off && i * 3 < off + count)
++			buf[i * 3 - off] = upt;
++		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
++			buf[i * 3 + 1 - off] = downt;
++		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
++			buf[i * 3 + 2 - off] = duty;
++	}
++
++	return count;
++}
++
++static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
++				UW_BIN_ATTR_ARG bin_attr,
++				char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off != 0 || count != total_size)
++		return -EINVAL;
++
++	/* UpT: Points 1..10 written to offsets 0..9; rest clamped to 0xFF */
++	for (i = 0; i < 16; i++) {
++		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu + i, upt_val);
++	}
++
++	/* DownT: Points 0..9 written to offsets 1..10; offset 0 set to 0 */
++	for (i = 0; i < 16; i++) {
++		u8 downt_val;
++		if (i == 0)
++			downt_val = 0;
++		else if (i < regmap->fan_points)
++			downt_val = buf[(i - 1) * 3 + 1];
++		else
++			downt_val = 0xFF;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
++				     regmap->fan_down_temp_offset + i, downt_val);
++	}
++
++	/* Duty: Points 0..10 scaled; rest clamped to 100 * scale */
++	for (i = 0; i < 16; i++) {
++		u8 duty_val;
++		if (i < regmap->fan_points) {
++			u8 d = buf[i * 3 + 2];
++			if (d > 100)
++				d = 100;
++			duty_val = regmap->fan_duty_scale ?
++				(d * regmap->fan_duty_scale) : d;
++		} else {
++			duty_val = regmap->fan_duty_scale ?
++				(100 * regmap->fan_duty_scale) : 100;
++		}
++		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
++				     regmap->fan_duty_offset + i, duty_val);
++	}
++
++	return count;
++}
++
++static struct bin_attribute bin_attr_fan_curve1 = {
++	.attr = { .name = "fan_curve1", .mode = 0644 },
++	.size = 33,
++	.read = fan_curve1_read,
++	.write = fan_curve1_write,
++};
++
++static ssize_t fan_curve2_read(struct file *filp, struct kobject *kobj,
++			       UW_BIN_ATTR_ARG bin_attr,
++			       char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off >= total_size)
++		return 0;
++	if (off + count > total_size)
++		count = total_size - off;
++
++	for (i = 0; i < regmap->fan_points; i++) {
++		u8 upt = 0, downt = 0, duty = 0;
++
++		if (i * 3 + 2 < off || i * 3 >= off + count)
++			continue;
++
++		/* Point 0 UpT is 0 C base; points 1..10 read from offsets 0..9 */
++		if (i == 0) {
++			upt = 0;
++		} else {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu + i - 1, &upt);
++		}
++
++		/* DownT for point i is in EC offset i + 1; last point reads offset i */
++		if (i < regmap->fan_points - 1) {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
++					    regmap->fan_down_temp_offset + i + 1, &downt);
++		} else {
++			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
++					    regmap->fan_down_temp_offset + i, &downt);
++		}
++
++		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
++				    regmap->fan_duty_offset + i, &duty);
++		if (regmap->fan_duty_scale)
++			duty /= regmap->fan_duty_scale;
++
++		if (i * 3 >= off && i * 3 < off + count)
++			buf[i * 3 - off] = upt;
++		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
++			buf[i * 3 + 1 - off] = downt;
++		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
++			buf[i * 3 + 2 - off] = duty;
++	}
++
++	return count;
++}
++
++static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
++				UW_BIN_ATTR_ARG bin_attr,
++				char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off != 0 || count != total_size)
++		return -EINVAL;
++
++	/* UpT: Points 1..10 written to offsets 0..9; rest clamped to 0xFF */
++	for (i = 0; i < 16; i++) {
++		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu + i, upt_val);
++	}
++
++	/* DownT: Points 0..9 written to offsets 1..10; offset 0 set to 0 */
++	for (i = 0; i < 16; i++) {
++		u8 downt_val;
++		if (i == 0)
++			downt_val = 0;
++		else if (i < regmap->fan_points)
++			downt_val = buf[(i - 1) * 3 + 1];
++		else
++			downt_val = 0xFF;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
++				     regmap->fan_down_temp_offset + i, downt_val);
++	}
++
++	/* Duty: Points 0..10 scaled; rest clamped to 100 * scale */
++	for (i = 0; i < 16; i++) {
++		u8 duty_val;
++		if (i < regmap->fan_points) {
++			u8 d = buf[i * 3 + 2];
++			if (d > 100)
++				d = 100;
++			duty_val = regmap->fan_duty_scale ?
++				(d * regmap->fan_duty_scale) : d;
++		} else {
++			duty_val = regmap->fan_duty_scale ?
++				(100 * regmap->fan_duty_scale) : 100;
++		}
++		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
++				     regmap->fan_duty_offset + i, duty_val);
++	}
++
++	return count;
++}
++
++static struct bin_attribute bin_attr_fan_curve2 = {
++	.attr = { .name = "fan_curve2", .mode = 0644 },
++	.size = 33,
++	.read = fan_curve2_read,
++	.write = fan_curve2_write,
++};
++
++static ssize_t fan_boost_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", !!(val & BIT(regmap->fan_boost_bit)));
++}
++
++static ssize_t fan_boost_store(struct device *dev, struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	bool enable;
++	u8 val = 0, readback = 0;
++	int ret;
++
++	if (kstrtobool(buf, &enable))
++		return -EINVAL;
++
++	ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++	if (ret)
++		return ret;
++
++	if (enable)
++		val |= BIT(regmap->fan_boost_bit);
++	else
++		val &= ~BIT(regmap->fan_boost_bit);
++
++	ret = uniwill_write_ec_ram(regmap->reg_power_led, val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_power_led, &readback);
++	if (ret || !!(readback & BIT(regmap->fan_boost_bit)) != enable)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(fan_boost);
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++static const struct bin_attribute *const uniwill_fan_bin_attrs[] = {
++	&bin_attr_fan_curve1,
++	&bin_attr_fan_curve2,
++	NULL,
++};
++#else
++static struct bin_attribute *uniwill_fan_bin_attrs[] = {
++	&bin_attr_fan_curve1,
++	&bin_attr_fan_curve2,
++	NULL,
++};
++#endif
++
++static struct attribute *uniwill_fan_attrs[] = {
++	&dev_attr_fan_boost.attr,
++	NULL,
++};
++
++static umode_t uniwill_fan_bin_attr_is_visible(struct kobject *kobj,
++					       UW_BIN_ATTR_ARG attr,
++					       int n)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	if (!regmap || !regmap->has_fan_table)
++		return 0;
++	return attr->attr.mode;
++}
++
++static const struct attribute_group uniwill_fan_attr_group = {
++	.attrs = uniwill_fan_attrs,
++	.bin_attrs = uniwill_fan_bin_attrs,
++	.is_bin_visible = uniwill_fan_bin_attr_is_visible,
++};
++
+ static int uniwill_keyboard_probe(struct platform_device *dev)
+ {
+ 	u32 i;
+@@ -2904,6 +3227,7 @@ static void uniwill_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
+ 	uniwill_exit_platform_profile(&dev->dev);
++	sysfs_remove_group(&dev->dev.kobj, &uniwill_fan_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_tdp_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_perf_attr_group);
+ 

@@ -312,11 +312,14 @@ static int uw_wmi_write_ec_ram(u16 addr, u8 data)
 	return result;
 }
 
+static int uw_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out);
+
 struct uniwill_interface_t uniwill_wmi_interface = {
 	.string_id = UNIWILL_INTERFACE_WMI_STRID,
 	.read_ec_ram = uw_wmi_read_ec_ram,
 	.write_ec_ram = uw_wmi_write_ec_ram,
-	.wmi_evaluate = uw_wmi_ec_evaluate
+	.wmi_evaluate = uw_wmi_ec_evaluate,
+	.wmi_oemg = uw_wmi_oemg
 };
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
@@ -394,7 +397,7 @@ static const struct wmi_device_id uniwill_wmi_device_ids[] = {
  * Used for hardware subsystem controls including discrete GPU power switching
  * and status queries (subsystem ID 0x0300).
  */
-int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
+static int uw_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
 {
 	acpi_status status;
 	union acpi_object *out_acpi;
@@ -419,15 +422,20 @@ int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
 		goto out_unlock;
 	}
 
-	if (status_out && out_acpi->type == ACPI_TYPE_BUFFER && out_acpi->buffer.length >= 1)
+	if (status_out) {
+		if (out_acpi->type != ACPI_TYPE_BUFFER ||
+		    out_acpi->buffer.length < 1 || !out_acpi->buffer.pointer) {
+			ret = -EIO;
+			goto out_unlock;
+		}
 		*status_out = out_acpi->buffer.pointer[0];
+	}
 
 out_unlock:
 	kfree(out_acpi);
 	mutex_unlock(&uniwill_ec_lock);
 	return ret;
 }
-EXPORT_SYMBOL(uniwill_wmi_oemg);
 
 static struct wmi_driver uniwill_wmi_driver = {
 	.driver = {

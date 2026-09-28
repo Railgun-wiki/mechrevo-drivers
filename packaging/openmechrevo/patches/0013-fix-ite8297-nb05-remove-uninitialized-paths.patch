@@ -1,0 +1,44 @@
+From 17eb120c8db9ceaf88a9bc97ce25330a0f645606 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 13:48:06 +0800
+Subject: [PATCH] fix(ite8297,nb05): remove uninitialized paths
+
+---
+ src/ite_8297/ite_8297.c                     | 5 +++--
+ src/tuxedo_nb05/tuxedo_nb05_kbd_backlight.c | 5 -----
+ 2 files changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/src/ite_8297/ite_8297.c b/src/ite_8297/ite_8297.c
+index 34bc25a..b3cd774 100644
+--- a/src/ite_8297/ite_8297.c
++++ b/src/ite_8297/ite_8297.c
+@@ -95,10 +95,11 @@ static int lightbar_set_blocking(struct led_classdev *led_cdev, enum led_brightn
+ 	} else if (led_blue) {
+ 		ite8297_driver_data = container_of(led_cdev, struct ite8297_driver_data_t, cdev_blue);
+ 		ite8297_driver_data->current_color.blue = brightness;
++	} else {
++		return -EINVAL;
+ 	}
+-	ite8297_write_state(ite8297_driver_data);
+ 
+-	return 0;
++	return ite8297_write_state(ite8297_driver_data);
+ }
+ 
+ static enum led_brightness lightbar_get(struct led_classdev *led_cdev)
+diff --git a/src/tuxedo_nb05/tuxedo_nb05_kbd_backlight.c b/src/tuxedo_nb05/tuxedo_nb05_kbd_backlight.c
+index 4b75e67..a26c8ff 100644
+--- a/src/tuxedo_nb05/tuxedo_nb05_kbd_backlight.c
++++ b/src/tuxedo_nb05/tuxedo_nb05_kbd_backlight.c
+@@ -101,11 +101,6 @@ static int __init tuxedo_nb05_kbd_backlight_probe(struct platform_device *pdev)
+ 
+ 	dev_set_drvdata(&pdev->dev, driver_data);
+ 
+-	if (result) {
+-		pr_err("Failed init write %d\n", result);
+-		return result;
+-	}
+-
+ 	result = init_leds(pdev);
+ 	if (result)
+ 		return result;

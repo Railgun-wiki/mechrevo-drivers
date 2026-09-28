@@ -1,0 +1,95 @@
+# Maintainer: OpenMechrevo Authors <dev@openmechrevo.org>
+# Contributor: Shiina Rikka <rikka@rikka.im>
+
+_pkgname=mechrevo-drivers
+pkgname=mechrevo-drivers-dkms
+pkgver=4.22.3
+pkgrel=2
+pkgdesc='Kernel modules for Mechrevo laptops and Uniwill ODM platforms via minimal incremental adaptation patches.'
+arch=('x86_64')
+url='https://github.com/OpenMechrevo/OpenMechrevo'
+license=('GPL-2.0-or-later')
+depends=('dkms')
+provides=(
+  'tuxedo-drivers-dkms'
+  'tuxedo-keyboard'
+  'tuxedo-keyboard-ite'
+  'tuxedo-io'
+  'clevo-wmi'
+  'clevo-acpi'
+  'uniwill-wmi'
+  'ite_8291'
+  'ite_8291_lb'
+  'ite_8297'
+  'ite_829x'
+)
+conflicts=('tuxedo-drivers-dkms' 'tuxedo-keyboard-dkms' 'tuxedo-keyboard-ite-dkms')
+
+source=(
+  "tuxedo-drivers-v${pkgver}.tar.gz::https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers/-/archive/v${pkgver}/tuxedo-drivers-v${pkgver}.tar.gz"
+  "dkms.conf"
+  "60-mechrevo.rules"
+  "0001-quirks-add-DMI-entries-for-Mechrevo-family.patch"
+  "0002-uniwill-extend-EC-abstraction-with-model-scoped-regi.patch"
+  "0003-uniwill-expose-perf-mode-power-led-via-sysfs.patch"
+  "0004-uniwill-expose-AMD-TDP-limits-via-sysfs.patch"
+  "0005-uniwill-expose-fan-curve-11-point-via-sysfs-binary-a.patch"
+  "0006-uniwill-expose-dGPU-power-cut-and-MUX-scheme-via-sys.patch"
+  "0007-Documentation-ABI-testing-sysfs-platform-mechrevo.patch"
+  "0008-uniwill-fix-custom-mode-fan-table-truncation-fan-boo.patch"
+  "0009-uniwill-support-kernel-glob-matching-for-models-with.patch"
+  "0010-uniwill-clamp-slot-15-DownTemp-read-offset-to-preven.patch"
+  "0011-uniwill-update-sysfs-binary-attribute-size-to-native.patch"
+  "0012-uniwill-support-GM6IXxB-three-fan-tables.patch"
+  "0013-fix-ite8297-nb05-remove-uninitialized-paths.patch"
+  "0014-uniwill-validate-ec-writes-and-fan-tables.patch"
+  "0015-uniwill-support-legacy-platform-profile-api.patch"
+  "0016-uniwill-break-wmi-keyboard-module-dependency-cycle.patch"
+)
+
+sha256sums=('1b1c9e25da4af408a58b547de79538c9077829e32bedcaa7ad48dccbc2b4b2c5'
+            '53929067eb528164c024d541adbefa7a8be02d06b256e00a3b889c5c31a9de6f'
+            'db9cc7457fd5039f5c16eee26261ebb9c1ba64021c068130f7bfcfa548640544'
+            '05cbff5b86a27e2bde8ab9b78c16100468982782d30a84fc1958902d3ac266f3'
+            '4cd05ae75576c4edab751cf2908904a2231e1441fa1073130a7197a0131e9de2'
+            '7862a6c6b310cebaec3f98454f43beef9b93c6a6487c000f59ad6e99454357d5'
+            '871e3db526daddc09761b646eaeeb2fbf8f05221122445b0927bf00390942878'
+            '6d0f3c35d65dfee4040a7337f2965f20dcfb66495b9bc4b9536f44bcb5e05ad2'
+            '2bb4334a931221bacd22ee664d2b3658c624c76ce4620e3df48faedd8944f43f'
+            'd88d4063c52cc7d984c9393c0944fdd5ffc8888ffb26e39d6f76b9383f1ed6d6'
+            '5814a362fbefb96b10609d70cb73b6ed26569b1880014233fcbc197f42103773'
+            'a8cc12b25b7990e8dc7634a16ed2878e00af6a4f7c234664f7a058905fa30821'
+            '5d0095d38ec61e3d50cdc16c2bc9d035144f447bfef506c29f21985a2adc7fe9'
+            '356033e4ed525323af00011d5a72dfa06c2b0261f4c36236d3a2e885f95c3f79'
+            'be53e8d2fac8bac30af66c8f13181aed06c733986c119ff23c86bf4fa62763f7'
+            '8a104c8cee0d83c28981b1ade8ba7651f2a3f5a43a028eec4efc97abe359481f'
+            'bce9dddb940324b72c4dea170de9f52ec0ee5aa0ed0908dc30901eaeebfb2173'
+            'ce6cdd003263126bec02f8d97087c2b335b303a5c3bc8fd6d6b2a90cb45740ee'
+            '2c845e6634f7f196d463e20c2f6aaaf471298790251e020b589d4809b44bf418')
+
+prepare() {
+  cd "${srcdir}/tuxedo-drivers-v${pkgver}"
+
+  local patch_file
+  for patch_file in "${srcdir}"/*.patch; do
+    if [ -f "${patch_file}" ]; then
+      msg2 "Applying patch: $(basename "${patch_file}")"
+      patch -Np1 -i "${patch_file}"
+    fi
+  done
+}
+
+package() {
+  install -Dm644 "${srcdir}/dkms.conf" "${pkgdir}/usr/src/${_pkgname}-${pkgver}/dkms.conf"
+  sed -i "s/#MODULE_VERSION#/${pkgver}/g" "${pkgdir}/usr/src/${_pkgname}-${pkgver}/dkms.conf"
+
+  install -Dm644 "${srcdir}/60-mechrevo.rules" "${pkgdir}/usr/lib/udev/rules.d/60-mechrevo.rules"
+
+  cd "${srcdir}/tuxedo-drivers-v${pkgver}"
+  install -Dm644 files/usr/lib/modprobe.d/*.conf -t "${pkgdir}/usr/lib/modprobe.d/" 2>/dev/null || true
+  install -Dm644 files/usr/lib/udev/rules.d/*.rules -t "${pkgdir}/usr/lib/udev/rules.d/" 2>/dev/null || true
+  install -Dm644 files/usr/lib/udev/hwdb.d/*.hwdb -t "${pkgdir}/usr/lib/udev/hwdb.d/" 2>/dev/null || true
+
+  mkdir -p "${pkgdir}/usr/src/${_pkgname}-${pkgver}"
+  cp -ar src/* "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
+}

@@ -1,0 +1,40 @@
+From eb7416dec156c21e09665e9aa4cb1c94af708465 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 15:53:57 +0800
+Subject: [PATCH] uniwill: clamp slot 15 DownTemp read offset to prevent
+ reading Duty in fan table
+
+---
+ src/uniwill_keyboard.h | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index a47963d..d8f9113 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2908,9 +2908,10 @@ static ssize_t fan_curve1_read(struct file *filp, struct kobject *kobj,
+ 			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu + i - 1, &upt);
+ 		}
+ 
+-		/* DownT for point i is in EC offset i + 1 */
++		/* DownT for point i is in EC offset i + 1 (clamp slot 15 to offset 15 to stay within DownT table) */
++		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+-				    regmap->fan_down_temp_offset + i + 1, &downt);
++				    regmap->fan_down_temp_offset + down_idx, &downt);
+ 
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+ 				    regmap->fan_duty_offset + i, &duty);
+@@ -3033,9 +3034,10 @@ static ssize_t fan_curve2_read(struct file *filp, struct kobject *kobj,
+ 			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu + i - 1, &upt);
+ 		}
+ 
+-		/* DownT for point i is in EC offset i + 1 */
++		/* DownT for point i is in EC offset i + 1 (clamp slot 15 to offset 15 to stay within DownT table) */
++		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+-				    regmap->fan_down_temp_offset + i + 1, &downt);
++				    regmap->fan_down_temp_offset + down_idx, &downt);
+ 
+ 		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+ 				    regmap->fan_duty_offset + i, &duty);

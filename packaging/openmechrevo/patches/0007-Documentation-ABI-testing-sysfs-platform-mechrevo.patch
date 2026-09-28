@@ -1,0 +1,138 @@
+From 357c1482718e204909893e0c2b03634998de01bf Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 16:29:20 +0800
+Subject: [PATCH] Documentation: ABI/testing/sysfs-platform-mechrevo
+
+Document sysfs platform ABI entries added for Mechrevo GM5HG0A and
+compatible Uniwill laptop platforms, covering perf_mode, power_led_mode,
+TDP power limits (tdp_spl, tdp_sppt, tdp_fppt), thermal limit (tcc_offset),
+11-point binary fan curves (fan_curve1, fan_curve2), fan_boost,
+discrete GPU power control (dgpu_power), and display MUX scheme (mux_scheme).
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ .../ABI/testing/sysfs-platform-mechrevo       | 115 ++++++++++++++++++
+ 1 file changed, 115 insertions(+)
+ create mode 100644 Documentation/ABI/testing/sysfs-platform-mechrevo
+
+diff --git a/Documentation/ABI/testing/sysfs-platform-mechrevo b/Documentation/ABI/testing/sysfs-platform-mechrevo
+new file mode 100644
+index 0000000..737ebec
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-platform-mechrevo
+@@ -0,0 +1,115 @@
++What:		/sys/devices/platform/tuxedo_keyboard/perf_mode
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		Platform performance mode selection. Reading returns the
++		current mode ("office", "gaming", "turbo", "custom", or "unknown").
++		Writing sets the mode register (EC 0x0751) and updates the
++		corresponding power LED indicators:
++		- "office": Power saving mode (EC 0xA0, LED mode 0)
++		- "gaming": Balanced / Gaming mode (EC 0x00, LED mode 1)
++		- "turbo": Maximum performance mode (EC 0x10, LED mode 2)
++		- "custom": User defined mode (EC 0x20, LED mode 1)
++
++What:		/sys/devices/platform/tuxedo_keyboard/power_led_mode
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		Direct control of the multi-color power LED indicator (EC 0x07A5).
++		Reading returns the current LED mode index (0..3).
++		Writing applies an atomic read-modify-write on bits 1:0 of the
++		status register while strictly preserving the silent (bit 2) and
++		fan boost (bit 4) status bits.
++
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl_min
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_spl_max
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		AMD CPU Sustained Power Limit (SPL / PL1) in Watts.
++		Writing tdp_spl clamps the input value between tdp_spl_min
++		and tdp_spl_max and performs post-write readback verification
++		returning -EIO on failure.
++
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt_min
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_sppt_max
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		AMD CPU Slow Package Power Tracking limit (sPPT / PL2) in Watts.
++		Writing clamps the value within [tdp_sppt_min, tdp_sppt_max]
++		and verifies written value against EC register.
++
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt_min
++What:		/sys/devices/platform/tuxedo_keyboard/tdp_fppt_max
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		AMD CPU Fast Package Power Tracking limit (fPPT / PL4) in Watts.
++		Writing clamps the value within [tdp_fppt_min, tdp_fppt_max]
++		and verifies written value against EC register.
++
++What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset
++What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset_min
++What:		/sys/devices/platform/tuxedo_keyboard/tcc_offset_max
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		CPU Temperature Control Circuit (TCC) target ceiling in deg C.
++		Writing clamps the value between tcc_offset_min and tcc_offset_max
++		and asserts bit 7 as the hardware enable flag (EC 0x0786).
++
++What:		/sys/devices/platform/tuxedo_keyboard/fan_curve1
++What:		/sys/devices/platform/tuxedo_keyboard/fan_curve2
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		[UNVERIFIED]: Raw 11-point hardware fan table binary attributes
++		for CPU (fan_curve1) and GPU (fan_curve2) fan channels.
++		Fixed size: 33 bytes (11 points * 3 bytes).
++		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
++		Reading fetches live table from EC (0x0F00/0x0F30). Writing programs
++		all 11 points directly into EC fan registers.
++
++What:		/sys/devices/platform/tuxedo_keyboard/fan_boost
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		One-key fan boost (maximum speed) control.
++		Reading returns 1 if boost is active, 0 otherwise.
++		Writing 1 or 0 toggles bit 4 of EC status register 0x07A5.
++
++What:		/sys/devices/platform/tuxedo_keyboard/dgpu_power
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		[UNVERIFIED: REBOOT PREFERRED]: Discrete GPU PCIe slot power control.
++		Reading calls ACPI AMW0.OEMG(0x0300, 2) and returns 1 if powered
++		(0xAA) or 0 if cut (0x55).
++		Writing 0 invokes OEMG(0x0300, 1) cutting PCIe slot power; writing 1
++		invokes OEMG(0x0300, 0) restoring power.
++		WARNING: Userspace MUST unbind GPU kernel driver and remove the PCIe
++		device before writing 0. On GM5HG0A platforms, switching graphics
++		modes is designed to take effect after system reboot (via MUX NVRAM).
++
++What:		/sys/devices/platform/tuxedo_keyboard/mux_scheme
++Date:		September 2026
++KernelVersion:	6.1
++Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
++Description:
++		Display MUX NVRAM variable scheme. Returns "amd" (0=MSHybrid, 1=dGPU,
++		2=iGPU), "intel" (4=MSHybrid, 2=dGPU, 1=iGPU), or "none" on platforms
++		without physical display MUX switching hardware. Automatically hidden
++		on motherboards without discrete graphics.

@@ -1,0 +1,13 @@
+# udev rules for OpenMechrevo platform attributes and power events
+#
+# Security & Safety Model:
+# - Hardware sysfs (/sys/devices/platform/tuxedo_keyboard) and raw EC character devices (/dev/tuxedo_io)
+#   remain restricted to root:root (0644 / 0600) to protect hardware against out-of-bound / unvalidated writes.
+# - All user-facing hardware control must go through the privileged 'mechrevod' daemon via
+#   UNIX domain socket /run/mechrevod.sock (owned by root:mechrevo, mode 0660) with strict bounds checking.
+
+# Hardware control character devices: strictly root privileged
+KERNEL=="tuxedo_io", OWNER="root", GROUP="root", MODE="0600"
+
+# AC adapter state changes (broadcast to active desktop session)
+SUBSYSTEM=="power_supply", ATTR{online}=="*", TAG+="uaccess", ENV{OPENMECHREVO_POWER_EVENT}="ac_adapter"

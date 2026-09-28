@@ -1,0 +1,386 @@
+From 1ae9945f366af80439ddeabc81151b55d8915b8f Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 13:47:32 +0800
+Subject: [PATCH] uniwill: support GM6IXxB three-fan tables
+
+---
+ .../ABI/testing/sysfs-platform-mechrevo       |   9 +-
+ src/uniwill_keyboard.h                        | 125 ++++++++++++++++++
+ src/uniwill_mechrevo_quirks.h                 |  33 ++++-
+ 3 files changed, 161 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-platform-mechrevo b/Documentation/ABI/testing/sysfs-platform-mechrevo
+index c3ad6e1..f331459 100644
+--- a/Documentation/ABI/testing/sysfs-platform-mechrevo
++++ b/Documentation/ABI/testing/sysfs-platform-mechrevo
+@@ -71,15 +71,18 @@ Description:
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_curve1
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_curve2
++What:		/sys/devices/platform/tuxedo_keyboard/fan_curve3
+ Date:		September 2026
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		Raw 16-point hardware fan table binary attributes for CPU
+-		(fan_curve1) and GPU (fan_curve2) fan channels (physical 16-slot table).
++		Raw 16-point logical fan table attributes. FanTable1p5 exposes its
++		CPU/GPU channels as fan_curve1/fan_curve2. FanTable2p0 exposes physical
++		fans 1/2/3 and mirrors each logical temperature ladder into that fan's
++		CPU and GPU threshold blocks while keeping one duty block.
+ 		Fixed size: 48 bytes (16 points * 3 bytes).
+ 		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
+-		Reading fetches live table from EC (0x0F00/0x0F30). Writing programs
++		Reading fetches the live CPU threshold and duty blocks. Writing programs
+ 		all 16 slots and asserts RAM table enable (0x07C6 bit 2) and
+ 		respective dual-fan control (0x07C5 bit 7).
+ 
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index ec2254b..56652ae 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2948,6 +2948,9 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 	for (i = 0; i < 16; i++) {
+ 		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu + i, upt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
++					     regmap->fan_gpu_up_temp_offset + i, upt_val);
+ 	}
+ 
+ 	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+@@ -2961,6 +2964,9 @@ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+ 			downt_val = 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
+ 				     regmap->fan_down_temp_offset + i, downt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
++					     regmap->fan_gpu_down_temp_offset + i, downt_val);
+ 	}
+ 
+ 	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+@@ -3074,6 +3080,9 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 	for (i = 0; i < 16; i++) {
+ 		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu + i, upt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
++					     regmap->fan_gpu_up_temp_offset + i, upt_val);
+ 	}
+ 
+ 	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+@@ -3087,6 +3096,9 @@ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+ 			downt_val = 0xFF;
+ 		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
+ 				     regmap->fan_down_temp_offset + i, downt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
++					     regmap->fan_gpu_down_temp_offset + i, downt_val);
+ 	}
+ 
+ 	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+@@ -3130,6 +3142,115 @@ static struct bin_attribute bin_attr_fan_curve2 = {
+ 	.write = fan_curve2_write,
+ };
+ 
++static ssize_t fan_curve3_read(struct file *filp, struct kobject *kobj,
++			       UW_BIN_ATTR_ARG bin_attr,
++			       char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off >= total_size)
++		return 0;
++	if (off + count > total_size)
++		count = total_size - off;
++
++	for (i = 0; i < regmap->fan_points; i++) {
++		u8 upt = 0, downt = 0, duty = 0;
++		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
++
++		if (i * 3 + 2 < off || i * 3 >= off + count)
++			continue;
++		if (i > 0)
++			uniwill_read_ec_ram(regmap->reg_fan_curve_mid + i - 1, &upt);
++		uniwill_read_ec_ram(regmap->reg_fan_curve_mid +
++				    regmap->fan_down_temp_offset + down_idx, &downt);
++		uniwill_read_ec_ram(regmap->reg_fan_curve_mid +
++				    regmap->fan_duty_offset + i, &duty);
++		if (regmap->fan_duty_scale)
++			duty /= regmap->fan_duty_scale;
++
++		if (i * 3 >= off && i * 3 < off + count)
++			buf[i * 3 - off] = upt;
++		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
++			buf[i * 3 + 1 - off] = downt;
++		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
++			buf[i * 3 + 2 - off] = duty;
++	}
++
++	return count;
++}
++
++static ssize_t fan_curve3_write(struct file *filp, struct kobject *kobj,
++				UW_BIN_ATTR_ARG bin_attr,
++				char *buf, loff_t off, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	size_t total_size;
++	int i;
++
++	if (!regmap || regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
++		return -EOPNOTSUPP;
++
++	total_size = regmap->fan_points * 3;
++	if (off != 0 || count != total_size)
++		return -EINVAL;
++
++	for (i = 0; i < 16; i++) {
++		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_mid + i, upt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
++					     regmap->fan_gpu_up_temp_offset + i, upt_val);
++	}
++
++	for (i = 0; i < 16; i++) {
++		u8 downt_val = i == 0 ? 0 : buf[(i - 1) * 3 + 1];
++		uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
++				     regmap->fan_down_temp_offset + i, downt_val);
++		if (regmap->fan_table_layout == 2)
++			uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
++					     regmap->fan_gpu_down_temp_offset + i, downt_val);
++	}
++
++	for (i = 0; i < 16; i++) {
++		u8 duty = buf[i * 3 + 2];
++
++		if (duty > 100)
++			duty = 100;
++		if (regmap->fan_duty_scale)
++			duty *= regmap->fan_duty_scale;
++		uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
++				     regmap->fan_duty_offset + i, duty);
++	}
++
++	{
++		u8 en_val = 0;
++
++		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
++			en_val |= BIT(2);
++			uniwill_write_ec_ram(0x07C6, en_val);
++		}
++		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
++			en_val |= BIT(7);
++			uniwill_write_ec_ram(0x07C5, en_val);
++		}
++	}
++
++	return count;
++}
++
++static struct bin_attribute bin_attr_fan_curve3 = {
++	.attr = { .name = "fan_curve3", .mode = 0644 },
++	.size = 48,
++	.read = fan_curve3_read,
++	.write = fan_curve3_write,
++};
++
+ static ssize_t fan_boost_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+@@ -3220,12 +3341,14 @@ static DEVICE_ATTR_RW(over_boost);
+ static const struct bin_attribute *const uniwill_fan_bin_attrs[] = {
+ 	&bin_attr_fan_curve1,
+ 	&bin_attr_fan_curve2,
++	&bin_attr_fan_curve3,
+ 	NULL,
+ };
+ #else
+ static struct bin_attribute *uniwill_fan_bin_attrs[] = {
+ 	&bin_attr_fan_curve1,
+ 	&bin_attr_fan_curve2,
++	&bin_attr_fan_curve3,
+ 	NULL,
+ };
+ #endif
+@@ -3244,6 +3367,8 @@ static umode_t uniwill_fan_bin_attr_is_visible(struct kobject *kobj,
+ 
+ 	if (!regmap || !regmap->has_fan_table)
+ 		return 0;
++	if (attr == &bin_attr_fan_curve3 && regmap->fan_channels < 3)
++		return 0;
+ 	return attr->attr.mode;
+ }
+ 
+diff --git a/src/uniwill_mechrevo_quirks.h b/src/uniwill_mechrevo_quirks.h
+index f41712e..8134b52 100644
+--- a/src/uniwill_mechrevo_quirks.h
++++ b/src/uniwill_mechrevo_quirks.h
+@@ -47,6 +47,7 @@ struct uniwill_ec_regmap {
+ 	u8 has_fan_table;
+ 	u8 fan_channels;
+ 	u8 fan_points;
++	u8 fan_table_layout; /* 1 = FanTable1p5, 2 = FanTable2p0 */
+ 	u16 reg_perf_mode;
+ 	u16 reg_power_led;
+ 	u16 reg_tdp_spl;
+@@ -59,6 +60,8 @@ struct uniwill_ec_regmap {
+ 	u8 fan_down_temp_offset;
+ 	u8 fan_duty_offset;
+ 	u8 fan_duty_scale;
++	u8 fan_gpu_up_temp_offset;
++	u8 fan_gpu_down_temp_offset;
+ 	u8 fan_boost_bit;
+ 	u8 has_tdp_control;
+ 	int tdp_spl_min;
+@@ -84,6 +87,7 @@ static const struct uniwill_ec_regmap default_uniwill_regmap = {
+ 	.has_fan_table = 0,
+ 	.fan_channels = 0,
+ 	.fan_points = 0,
++	.fan_table_layout = 0,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -96,6 +100,8 @@ static const struct uniwill_ec_regmap default_uniwill_regmap = {
+ 	.fan_down_temp_offset = 0,
+ 	.fan_duty_offset = 0,
+ 	.fan_duty_scale = 0,
++	.fan_gpu_up_temp_offset = 0,
++	.fan_gpu_down_temp_offset = 0,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 5,
+@@ -121,6 +127,7 @@ static const struct uniwill_ec_regmap generic_uniwill_regmap = {
+ 	.has_fan_table = 0,
+ 	.fan_channels = 0,
+ 	.fan_points = 0,
++	.fan_table_layout = 0,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -133,6 +140,8 @@ static const struct uniwill_ec_regmap generic_uniwill_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 5,
+@@ -158,6 +167,7 @@ static const struct uniwill_ec_regmap gm5hg0a_regmap = {
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+ 	.fan_points = 16,
++	.fan_table_layout = 1,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -170,6 +180,8 @@ static const struct uniwill_ec_regmap gm5hg0a_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 5,
+@@ -195,6 +207,7 @@ static const struct uniwill_ec_regmap gm5ixxa_regmap = {
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+ 	.fan_points = 16,
++	.fan_table_layout = 1,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -207,6 +220,8 @@ static const struct uniwill_ec_regmap gm5ixxa_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 25,
+@@ -232,6 +247,7 @@ static const struct uniwill_ec_regmap gm6ixxb_regmap = {
+ 	.has_fan_table = 1,
+ 	.fan_channels = 3,
+ 	.fan_points = 16,
++	.fan_table_layout = 2,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -239,11 +255,13 @@ static const struct uniwill_ec_regmap gm6ixxb_regmap = {
+ 	.reg_tdp_fppt = 0x0785,
+ 	.reg_tcc_offset = 0x0786,
+ 	.reg_fan_curve_cpu = 0x0F00,
+-	.reg_fan_curve_gpu = 0x0F30,
+-	.reg_fan_curve_mid = 0x0F60,
++	.reg_fan_curve_gpu = 0x0F50,
++	.reg_fan_curve_mid = 0x0FA0,
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+-	.fan_duty_scale = 2,
++	.fan_duty_scale = 1,
++	.fan_gpu_up_temp_offset = 0x30,
++	.fan_gpu_down_temp_offset = 0x40,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 25,
+@@ -269,6 +287,7 @@ static const struct uniwill_ec_regmap gmxrgxx_regmap = {
+ 	.has_fan_table = 1,
+ 	.fan_channels = 2,
+ 	.fan_points = 16,
++	.fan_table_layout = 1,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -281,6 +300,8 @@ static const struct uniwill_ec_regmap gmxrgxx_regmap = {
+ 	.fan_down_temp_offset = 0x10,
+ 	.fan_duty_offset = 0x20,
+ 	.fan_duty_scale = 2,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 5,
+@@ -306,6 +327,7 @@ static const struct uniwill_ec_regmap unsupported_non_tongfang_regmap = {
+ 	.has_fan_table = 0,
+ 	.fan_channels = 0,
+ 	.fan_points = 0,
++	.fan_table_layout = 0,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -318,6 +340,8 @@ static const struct uniwill_ec_regmap unsupported_non_tongfang_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 0,
+ 	.tdp_spl_min = 0,
+@@ -343,6 +367,7 @@ static const struct uniwill_ec_regmap wujie14p_regmap = {
+ 	.has_fan_table = 0,
+ 	.fan_channels = 0,
+ 	.fan_points = 0,
++	.fan_table_layout = 0,
+ 	.reg_perf_mode = 0x0751,
+ 	.reg_power_led = 0x07A5,
+ 	.reg_tdp_spl = 0x0783,
+@@ -355,6 +380,8 @@ static const struct uniwill_ec_regmap wujie14p_regmap = {
+ 	.fan_down_temp_offset = 0x00,
+ 	.fan_duty_offset = 0x00,
+ 	.fan_duty_scale = 0,
++	.fan_gpu_up_temp_offset = 0x00,
++	.fan_gpu_down_temp_offset = 0x00,
+ 	.fan_boost_bit = 6,
+ 	.has_tdp_control = 1,
+ 	.tdp_spl_min = 15,

@@ -1,0 +1,7 @@
+mechrevo-drivers-dkms (4.22.3-1) unstable; urgency=medium
+
+  * Initial release of OpenMechrevo DKMS driver adaptation.
+  * Added DMI quirks and model-scoped regmap indirection for GM5HG0A.
+  * Exposed perf_mode, power_led_mode, TDP limits, fan curves, and dgpu_power.
+
+ -- OpenMechrevo Authors <dev@openmechrevo.org>  Thu, 03 Sep 2026 15:00:00 +0800

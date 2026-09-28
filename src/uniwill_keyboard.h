@@ -215,6 +215,16 @@ int uniwill_wmi_evaluate(u8 function, u32 arg, u32 *return_buffer)
 }
 EXPORT_SYMBOL(uniwill_wmi_evaluate);
 
+/* Use the registered interface, not a symbol in the dependent WMI module. */
+int uniwill_wmi_oemg(u8 cmd, u32 subsystem, u8 *status_out)
+{
+	if (IS_ERR_OR_NULL(uniwill_interfaces.wmi) ||
+	    !uniwill_interfaces.wmi->wmi_oemg)
+		return -ENODEV;
+
+	return uniwill_interfaces.wmi->wmi_oemg(cmd, subsystem, status_out);
+}
+
 static DEFINE_MUTEX(uniwill_interface_modification_lock);
 
 int uniwill_add_interface(struct uniwill_interface_t *interface)

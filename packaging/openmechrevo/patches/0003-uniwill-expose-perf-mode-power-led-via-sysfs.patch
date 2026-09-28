@@ -1,0 +1,479 @@
+From 52ab2d75561bd0a73f21bfdd507b20306108c4a3 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 16:29:19 +0800
+Subject: [PATCH] uniwill: expose perf mode + power led via sysfs
+
+Expose sysfs attributes perf_mode and power_led_mode under the existing
+tuxedo_keyboard platform device. perf_mode validates requests against the
+model-scoped supported_modes_mask (office, gaming, turbo, custom),
+safely rejecting unsupported modes on 2-mode thin laptops with -EOPNOTSUPP,
+and synchronizes the power LED status bits 1:0.
+
+Additionally, register uniwill_keyboard with the Linux platform_profile
+subsystem (with dual compatibility supporting both legacy handler and
+Linux 6.13+ platform_profile_ops), providing native power profile integration
+for desktop environments such as GNOME and KDE.
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ src/uniwill_keyboard.h | 419 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 415 insertions(+), 4 deletions(-)
+
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index 158099e..0ac0761 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -40,6 +40,9 @@
+ #include "uniwill_interfaces.h"
+ #include "uniwill_leds.h"
+ #include "uniwill_mechrevo_quirks.h"
++#if defined(CONFIG_ACPI_PLATFORM_PROFILE) || defined(CONFIG_ACPI_PLATFORM_PROFILE_MODULE)
++#include <linux/platform_profile.h>
++#endif
+ 
+ #define FAN_ON_MIN_SPEED_PERCENT 25
+ 
+@@ -2180,6 +2183,392 @@ static bool uniwill_i8042_filter(unsigned char data, unsigned char str,
+ 	return false;
+ }
+ 
++/*
++ * Sysfs performance mode and power LED interfaces.
++ * Allows user-space tools and the kernel platform profile subsystem to control
++ * mode profiles (office, gaming, turbo, custom) and read-modify-write status LEDs.
++ */
++
++
++
++#if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++static struct device *uniwill_pprof_dev;
++#else
++static struct platform_profile_handler uniwill_pprof_handler;
++#endif
++#endif
++
++static void uniwill_notify_platform_profile(void)
++{
++#if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++	if (uniwill_pprof_dev)
++		platform_profile_notify(uniwill_pprof_dev);
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
++	platform_profile_notify();
++#endif
++#endif
++}
++
++static ssize_t perf_mode_show(struct device *dev,
++			      struct device_attribute *attr,
++			      char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode = 0;
++	int ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
++	if (ret)
++		return ret;
++
++	switch (mode) {
++	case 0xa0:
++		return sysfs_emit(buf, "office\n");
++	case 0x00:
++		return sysfs_emit(buf, "gaming\n");
++	case 0x10:
++		return sysfs_emit(buf, "turbo\n");
++	case 0x20:
++		return sysfs_emit(buf, "custom\n");
++	default:
++		return sysfs_emit(buf, "unknown\n");
++	}
++}
++
++static ssize_t perf_mode_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode_val, led_mode;
++	char str[16];
++	int ret;
++
++	if (sscanf(buf, "%15s", str) != 1)
++		return -EINVAL;
++
++	if (sysfs_streq(str, "office")) {
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_OFFICE_BIT))
++			return -EOPNOTSUPP;
++		mode_val = 0xa0;
++		led_mode = 0;
++	} else if (sysfs_streq(str, "gaming") || sysfs_streq(str, "balanced")) {
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_GAMING_BIT))
++			return -EOPNOTSUPP;
++		mode_val = 0x00;
++		led_mode = 1;
++	} else if (sysfs_streq(str, "turbo")) {
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT))
++			return -EOPNOTSUPP;
++		mode_val = 0x10;
++		led_mode = 2;
++	} else if (sysfs_streq(str, "custom")) {
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
++			return -EOPNOTSUPP;
++		mode_val = 0x20;
++		led_mode = 1;
++	} else {
++		return -EINVAL;
++	}
++
++	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, mode_val);
++	if (ret)
++		return ret;
++
++	/* Synchronize power LED status bits 1:0 preserving other bits */
++	{
++		u8 led_val = 0;
++
++		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
++			led_val = (led_val & ~0x03) | (led_mode & 0x03);
++			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
++		}
++	}
++
++	uniwill_notify_platform_profile();
++	return count;
++}
++static DEVICE_ATTR_RW(perf_mode);
++
++static ssize_t power_led_mode_show(struct device *dev,
++				   struct device_attribute *attr,
++				   char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n", val & 0x03);
++}
++
++static ssize_t power_led_mode_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode, val = 0, readback = 0;
++	int ret;
++
++	if (kstrtou8(buf, 0, &mode) || mode > 3)
++		return -EINVAL;
++
++	ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
++	if (ret)
++		return ret;
++
++	val = (val & ~0x03) | (mode & 0x03);
++	ret = uniwill_write_ec_ram(regmap->reg_power_led, val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_power_led, &readback);
++	if (ret || (readback & 0x03) != (mode & 0x03))
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(power_led_mode);
++
++#if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++static int uniwill_pprof_probe(void *drvdata, unsigned long *choices)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	set_bit(PLATFORM_PROFILE_QUIET, choices);
++	set_bit(PLATFORM_PROFILE_BALANCED, choices);
++	if (regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT)
++		set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
++	if (regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT)
++		set_bit(PLATFORM_PROFILE_CUSTOM, choices);
++	return 0;
++}
++
++static int uniwill_pprof_get(struct device *dev, enum platform_profile_option *profile)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode = 0;
++	int ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
++	if (ret)
++		return ret;
++
++	switch (mode) {
++	case 0xa0:
++		*profile = PLATFORM_PROFILE_QUIET;
++		break;
++	case 0x00:
++		*profile = PLATFORM_PROFILE_BALANCED;
++		break;
++	case 0x10:
++		*profile = PLATFORM_PROFILE_PERFORMANCE;
++		break;
++	case 0x20:
++		*profile = PLATFORM_PROFILE_CUSTOM;
++		break;
++	default:
++		*profile = PLATFORM_PROFILE_BALANCED;
++		break;
++	}
++	return 0;
++}
++
++static int uniwill_pprof_set(struct device *dev, enum platform_profile_option profile)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode, led;
++
++	switch (profile) {
++	case PLATFORM_PROFILE_QUIET:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_OFFICE_BIT))
++			return -EOPNOTSUPP;
++		mode = 0xa0;
++		led = 0;
++		break;
++	case PLATFORM_PROFILE_BALANCED:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_GAMING_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x00;
++		led = 1;
++		break;
++	case PLATFORM_PROFILE_PERFORMANCE:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x10;
++		led = 2;
++		break;
++	case PLATFORM_PROFILE_CUSTOM:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x20;
++		led = 1;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	uniwill_write_ec_ram(regmap->reg_perf_mode, mode);
++	{
++		u8 led_val = 0;
++
++		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
++			led_val = (led_val & ~0x03) | (led & 0x03);
++			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
++		}
++	}
++	return 0;
++}
++
++static const struct platform_profile_ops uniwill_pprof_ops = {
++	.probe = uniwill_pprof_probe,
++	.profile_get = uniwill_pprof_get,
++	.profile_set = uniwill_pprof_set,
++};
++#else
++static int uniwill_pprof_get(struct platform_profile_handler *pprof,
++			     enum platform_profile_option *profile)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode = 0;
++	int ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &mode);
++	if (ret)
++		return ret;
++
++	switch (mode) {
++	case 0xa0:
++		*profile = PLATFORM_PROFILE_QUIET;
++		break;
++	case 0x00:
++		*profile = PLATFORM_PROFILE_BALANCED;
++		break;
++	case 0x10:
++		*profile = PLATFORM_PROFILE_PERFORMANCE;
++		break;
++	case 0x20:
++		*profile = PLATFORM_PROFILE_CUSTOM;
++		break;
++	default:
++		*profile = PLATFORM_PROFILE_BALANCED;
++		break;
++	}
++	return 0;
++}
++
++static int uniwill_pprof_set(struct platform_profile_handler *pprof,
++			     enum platform_profile_option profile)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 mode, led;
++
++	switch (profile) {
++	case PLATFORM_PROFILE_QUIET:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_OFFICE_BIT))
++			return -EOPNOTSUPP;
++		mode = 0xa0;
++		led = 0;
++		break;
++	case PLATFORM_PROFILE_BALANCED:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_GAMING_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x00;
++		led = 1;
++		break;
++	case PLATFORM_PROFILE_PERFORMANCE:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x10;
++		led = 2;
++		break;
++	case PLATFORM_PROFILE_CUSTOM:
++		if (!(regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT))
++			return -EOPNOTSUPP;
++		mode = 0x20;
++		led = 1;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	uniwill_write_ec_ram(regmap->reg_perf_mode, mode);
++	{
++		u8 led_val = 0;
++
++		if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
++			led_val = (led_val & ~0x03) | (led & 0x03);
++			uniwill_write_ec_ram(regmap->reg_power_led, led_val);
++		}
++	}
++	return 0;
++}
++
++static struct platform_profile_handler uniwill_pprof_handler = {
++	.name = "uniwill-mechrevo",
++	.profile_get = uniwill_pprof_get,
++	.profile_set = uniwill_pprof_set,
++};
++#endif
++#endif
++
++static void uniwill_init_platform_profile(struct device *dev)
++{
++#if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++	uniwill_pprof_dev = platform_profile_register(dev, "uniwill-mechrevo",
++						      NULL, &uniwill_pprof_ops);
++	if (IS_ERR(uniwill_pprof_dev)) {
++		pr_debug("platform_profile_register not available: %ld\n",
++			 PTR_ERR(uniwill_pprof_dev));
++		uniwill_pprof_dev = NULL;
++	}
++#else
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	set_bit(PLATFORM_PROFILE_QUIET, uniwill_pprof_handler.choices);
++	set_bit(PLATFORM_PROFILE_BALANCED, uniwill_pprof_handler.choices);
++	if (regmap->supported_modes_mask & UNIWILL_MODE_TURBO_BIT)
++		set_bit(PLATFORM_PROFILE_PERFORMANCE, uniwill_pprof_handler.choices);
++	if (regmap->supported_modes_mask & UNIWILL_MODE_CUSTOM_BIT)
++		set_bit(PLATFORM_PROFILE_CUSTOM, uniwill_pprof_handler.choices);
++	uniwill_pprof_handler.dev = dev;
++	if (platform_profile_register(&uniwill_pprof_handler))
++		pr_debug("platform_profile_register failed or already registered\n");
++#endif
++#endif
++}
++
++static void uniwill_exit_platform_profile(struct device *dev)
++{
++#if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++	if (uniwill_pprof_dev) {
++		platform_profile_remove(uniwill_pprof_dev);
++		uniwill_pprof_dev = NULL;
++	}
++#else
++	platform_profile_remove(&uniwill_pprof_handler);
++#endif
++#endif
++}
++
++static struct attribute *uniwill_perf_attrs[] = {
++	&dev_attr_perf_mode.attr,
++	&dev_attr_power_led_mode.attr,
++	NULL,
++};
++
++static const struct attribute_group uniwill_perf_attr_group = {
++	.attrs = uniwill_perf_attrs,
++};
++
+ static int uniwill_keyboard_probe(struct platform_device *dev)
+ {
+ 	u32 i;
+@@ -2191,10 +2580,15 @@ static int uniwill_keyboard_probe(struct platform_device *dev)
+ 
+ 	uw_feats = uniwill_get_device_features();
+ 
+-	// FIXME Hard set balanced profile until we have implemented a way to
+-	// switch it while tuxedo_io is loaded
+-	// uw_ec_write_addr(0x51, 0x07, 0x00, 0x00, &reg_write_return);
+-	uniwill_write_ec_ram(0x0751, 0x00);
++	/* Initialize performance mode register only if unset or invalid */
++	{
++		const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++		u8 cur_mode = 0;
++
++		if (uniwill_read_ec_ram(regmap->reg_perf_mode, &cur_mode) != 0 ||
++		    (cur_mode != 0xa0 && cur_mode != 0x00 && cur_mode != 0x10 && cur_mode != 0x20))
++			uniwill_write_ec_ram(regmap->reg_perf_mode, 0x00);
++	}
+ 
+ 	if (uw_feats->uniwill_profile_v1) {
+ 		// Set manual-mode fan-curve in 0x0743 - 0x0747
+@@ -2234,6 +2628,20 @@ static int uniwill_keyboard_probe(struct platform_device *dev)
+ 	uw_show_hidden_bios_options();
+ 	uw_battery_init();
+ 
++	status = sysfs_create_group(&dev->dev.kobj, &uniwill_perf_attr_group);
++	if (status)
++		pr_warn("Failed to create uniwill perf sysfs group: %d\n", status);
++	status = sysfs_create_group(&dev->dev.kobj, &uniwill_tdp_attr_group);
++	if (status)
++		pr_warn("Failed to create uniwill tdp sysfs group: %d\n", status);
++	status = sysfs_create_group(&dev->dev.kobj, &uniwill_fan_attr_group);
++	if (status)
++		pr_warn("Failed to create uniwill fan sysfs group: %d\n", status);
++	status = sysfs_create_group(&dev->dev.kobj, &uniwill_dgpu_attr_group);
++	if (status)
++		pr_warn("Failed to create uniwill dgpu sysfs group: %d\n", status);
++	uniwill_init_platform_profile(&dev->dev);
++
+ 	// Ignore return value, it just means there is already a filter active
+ 	// which is fine, because it is probably just the upstream patch of this
+ 	// filter.
+@@ -2253,6 +2661,9 @@ static int uniwill_keyboard_remove(struct platform_device *dev)
+ static void uniwill_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
++	uniwill_exit_platform_profile(&dev->dev);
++	sysfs_remove_group(&dev->dev.kobj, &uniwill_perf_attr_group);
++
+ 	if (uw_charging_prio_loaded)
+ 		sysfs_remove_group(&dev->dev.kobj, &uw_charging_prio_attr_group);
+ 

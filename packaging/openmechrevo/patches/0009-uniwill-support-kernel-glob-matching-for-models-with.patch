@@ -1,0 +1,90 @@
+From 89ef6c3965e7b9d929648ccb0f5dd800a955228b Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Sun, 6 Sep 2026 15:34:23 +0800
+Subject: [PATCH] uniwill: support kernel glob matching for models with middle
+ wildcards
+
+---
+ src/uniwill_mechrevo_quirks.h | 34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/uniwill_mechrevo_quirks.h b/src/uniwill_mechrevo_quirks.h
+index 5079b0b..f41712e 100644
+--- a/src/uniwill_mechrevo_quirks.h
++++ b/src/uniwill_mechrevo_quirks.h
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/dmi.h>
++#include <linux/glob.h>
+ 
+ enum uniwill_cpu_vendor {
+ 	UNIWILL_CPU_GENERIC = 0,
+@@ -383,15 +384,27 @@ static const struct uniwill_dmi_regmap_entry uniwill_dmi_regmap_table[] = {
+ 	{ "MECHREVO", "GM5HG", NULL, &gm5hg0a_regmap },
+ 	{ "MECHREVO", NULL, "yilong15", &gm5hg0a_regmap },
+ 	{ "MECHREVO", NULL, "STELLSL15A06", &gm5hg0a_regmap },
++	{ "MECHREVO", "*GM5IX?A*", NULL, &gm5ixxa_regmap },
++	{ "MECHREVO", "GM5IX0A", NULL, &gm5ixxa_regmap },
++	{ "MECHREVO", "GM5IX1A", NULL, &gm5ixxa_regmap },
++	{ "MECHREVO", "GM5IX7A", NULL, &gm5ixxa_regmap },
++	{ "MECHREVO", "GM5IX8A", NULL, &gm5ixxa_regmap },
++	{ "MECHREVO", "GM5IX9A", NULL, &gm5ixxa_regmap },
+ 	{ "MECHREVO", "GM5IX", NULL, &gm5ixxa_regmap },
+ 	{ "MECHREVO", NULL, "STELLSL15I06", &gm5ixxa_regmap },
+ 	{ "MECHREVO", NULL, "yilong15i", &gm5ixxa_regmap },
+-	{ "MECHREVO", "GM6IX", NULL, &gm6ixxb_regmap },
+-	{ "MECHREVO", "GM6IXxB", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "*GM6IX?B*", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "GM6IX0B", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "GM6IX1B", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "GM6IX7B", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "GM6IX8B", NULL, &gm6ixxb_regmap },
++	{ "MECHREVO", "GM6IX9B", NULL, &gm6ixxb_regmap },
+ 	{ "MECHREVO", NULL, "kuangshi16", &gm6ixxb_regmap },
+ 	{ "MECHREVO", NULL, "STELLARIS16I06", &gm6ixxb_regmap },
+ 	{ "MECHREVO", "GM5RG", NULL, &gmxrgxx_regmap },
+ 	{ "MECHREVO", "GM6RG", NULL, &gmxrgxx_regmap },
++	{ "MECHREVO", "*GM?RG*", NULL, &gmxrgxx_regmap },
++	{ "MECHREVO", "*GM*RG*", NULL, &gmxrgxx_regmap },
+ 	{ "MECHREVO", NULL, "jiaolong", &gmxrgxx_regmap },
+ 	{ "MECHREVO", NULL, "STEPOL1XA04", &gmxrgxx_regmap },
+ 	{ "MECHREVO", NULL, "POLARIS1XA05", &gmxrgxx_regmap },
+@@ -403,6 +416,19 @@ static const struct uniwill_dmi_regmap_entry uniwill_dmi_regmap_table[] = {
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
++/*
++ * Matches string with either shell glob pattern or substring search.
++ * Zero heap allocation, safe for early boot and kernel DMI matching.
++ */
++static inline bool uniwill_dmi_match_string(const char *pattern, const char *str)
++{
++	if (!pattern || !str)
++		return false;
++	if (strchr(pattern, '*') || strchr(pattern, '?') || strchr(pattern, '['))
++		return glob_match(pattern, str);
++	return strstr(str, pattern) != NULL;
++}
++
+ /* Lookup model regmap from system DMI table */
+ static inline const struct uniwill_ec_regmap *uniwill_match_ec_regmap(void)
+ {
+@@ -430,7 +456,7 @@ static inline const struct uniwill_ec_regmap *uniwill_match_ec_regmap(void)
+ 			if (!vendor_match)
+ 				continue;
+ 		}
+-		if (board_name && strstr(board_name, entry->board_name))
++		if (board_name && uniwill_dmi_match_string(entry->board_name, board_name))
+ 			return entry->regmap;
+ 	}
+ 
+@@ -447,7 +473,7 @@ static inline const struct uniwill_ec_regmap *uniwill_match_ec_regmap(void)
+ 			if (!vendor_match)
+ 				continue;
+ 		}
+-		if (product_name && strstr(product_name, entry->product_name))
++		if (product_name && uniwill_dmi_match_string(entry->product_name, product_name))
+ 			return entry->regmap;
+ 	}
+ 

@@ -1,0 +1,281 @@
+From 1141686fe94098ec706cefd4b68f14a2f49cf258 Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 16:29:20 +0800
+Subject: [PATCH] uniwill: expose AMD TDP limits via sysfs
+
+Expose AMD CPU power limit attributes (tdp_spl, tdp_sppt, tdp_fppt) and
+the thermal ceiling limit (tcc_offset) along with companion *_min and *_max
+boundary limits under the tuxedo_keyboard sysfs device.
+
+Attributes are conditionally exposed via .is_visible only on motherboards
+whose regmap flags TDP control support. Enforce boundary clamping against
+the model-scoped regmap ranges, write TCC target temperatures with bit 7
+asserted as hardware enable flag, and perform post-write readback verification
+returning -EIO if the written register does not match the expected state.
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ src/uniwill_keyboard.h | 243 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 243 insertions(+)
+
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index 0ac0761..bb2819d 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -2569,6 +2569,248 @@ static const struct attribute_group uniwill_perf_attr_group = {
+ 	.attrs = uniwill_perf_attrs,
+ };
+ 
++/*
++ * AMD CPU power limits (TDP SPL / sPPT / fPPT) and thermal ceiling (TCC offset).
++ * Writes are clamped within model boundaries, with post-write readback verification.
++ */
++
++static ssize_t tdp_spl_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_tdp_spl, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++static ssize_t tdp_spl_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	unsigned int val;
++	u8 readback = 0;
++	int ret;
++
++	if (kstrtouint(buf, 0, &val))
++		return -EINVAL;
++
++	val = clamp_val(val, regmap->tdp_spl_min, regmap->tdp_spl_max);
++	ret = uniwill_write_ec_ram(regmap->reg_tdp_spl, (u8)val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_tdp_spl, &readback);
++	if (ret || readback != (u8)val)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(tdp_spl);
++
++static ssize_t tdp_spl_min_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_spl_min);
++}
++static DEVICE_ATTR_RO(tdp_spl_min);
++
++static ssize_t tdp_spl_max_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_spl_max);
++}
++static DEVICE_ATTR_RO(tdp_spl_max);
++
++static ssize_t tdp_sppt_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_tdp_sppt, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++static ssize_t tdp_sppt_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	unsigned int val;
++	u8 readback = 0;
++	int ret;
++
++	if (kstrtouint(buf, 0, &val))
++		return -EINVAL;
++
++	val = clamp_val(val, regmap->tdp_sppt_min, regmap->tdp_sppt_max);
++	ret = uniwill_write_ec_ram(regmap->reg_tdp_sppt, (u8)val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_tdp_sppt, &readback);
++	if (ret || readback != (u8)val)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(tdp_sppt);
++
++static ssize_t tdp_sppt_min_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_sppt_min);
++}
++static DEVICE_ATTR_RO(tdp_sppt_min);
++
++static ssize_t tdp_sppt_max_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_sppt_max);
++}
++static DEVICE_ATTR_RO(tdp_sppt_max);
++
++static ssize_t tdp_fppt_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_tdp_fppt, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", val);
++}
++
++static ssize_t tdp_fppt_store(struct device *dev, struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	unsigned int val;
++	u8 readback = 0;
++	int ret;
++
++	if (kstrtouint(buf, 0, &val))
++		return -EINVAL;
++
++	val = clamp_val(val, regmap->tdp_fppt_min, regmap->tdp_fppt_max);
++	ret = uniwill_write_ec_ram(regmap->reg_tdp_fppt, (u8)val);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_tdp_fppt, &readback);
++	if (ret || readback != (u8)val)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(tdp_fppt);
++
++static ssize_t tdp_fppt_min_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_fppt_min);
++}
++static DEVICE_ATTR_RO(tdp_fppt_min);
++
++static ssize_t tdp_fppt_max_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tdp_fppt_max);
++}
++static DEVICE_ATTR_RO(tdp_fppt_max);
++
++static ssize_t tcc_offset_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 val = 0;
++	int ret = uniwill_read_ec_ram(regmap->reg_tcc_offset, &val);
++
++	if (ret)
++		return ret;
++	return sysfs_emit(buf, "%u\n", val & 0x7f);
++}
++
++static ssize_t tcc_offset_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	unsigned int val;
++	u8 readback = 0;
++	int ret;
++
++	if (kstrtouint(buf, 0, &val))
++		return -EINVAL;
++
++	val = clamp_val(val, regmap->tcc_offset_min, regmap->tcc_offset_max);
++	/* Write target temperature with bit 7 asserted as hardware enable flag */
++	ret = uniwill_write_ec_ram(regmap->reg_tcc_offset, (u8)val | 0x80);
++	if (ret)
++		return ret;
++
++	ret = uniwill_read_ec_ram(regmap->reg_tcc_offset, &readback);
++	if (ret || (readback & 0x7f) != (u8)val)
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_RW(tcc_offset);
++
++static ssize_t tcc_offset_min_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tcc_offset_min);
++}
++static DEVICE_ATTR_RO(tcc_offset_min);
++
++static ssize_t tcc_offset_max_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	return sysfs_emit(buf, "%d\n", regmap->tcc_offset_max);
++}
++static DEVICE_ATTR_RO(tcc_offset_max);
++
++static struct attribute *uniwill_tdp_attrs[] = {
++	&dev_attr_tdp_spl.attr,
++	&dev_attr_tdp_spl_min.attr,
++	&dev_attr_tdp_spl_max.attr,
++	&dev_attr_tdp_sppt.attr,
++	&dev_attr_tdp_sppt_min.attr,
++	&dev_attr_tdp_sppt_max.attr,
++	&dev_attr_tdp_fppt.attr,
++	&dev_attr_tdp_fppt_min.attr,
++	&dev_attr_tdp_fppt_max.attr,
++	&dev_attr_tcc_offset.attr,
++	&dev_attr_tcc_offset_min.attr,
++	&dev_attr_tcc_offset_max.attr,
++	NULL,
++};
++
++static umode_t uniwill_tdp_attr_is_visible(struct kobject *kobj,
++					   struct attribute *attr,
++					   int n)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++
++	if (!regmap || !regmap->has_tdp_control)
++		return 0;
++	return attr->mode;
++}
++
++static const struct attribute_group uniwill_tdp_attr_group = {
++	.attrs = uniwill_tdp_attrs,
++	.is_visible = uniwill_tdp_attr_is_visible,
++};
++
+ static int uniwill_keyboard_probe(struct platform_device *dev)
+ {
+ 	u32 i;
+@@ -2662,6 +2904,7 @@ static void uniwill_keyboard_remove(struct platform_device *dev)
+ #endif
+ {
+ 	uniwill_exit_platform_profile(&dev->dev);
++	sysfs_remove_group(&dev->dev.kobj, &uniwill_tdp_attr_group);
+ 	sysfs_remove_group(&dev->dev.kobj, &uniwill_perf_attr_group);
+ 
+ 	if (uw_charging_prio_loaded)

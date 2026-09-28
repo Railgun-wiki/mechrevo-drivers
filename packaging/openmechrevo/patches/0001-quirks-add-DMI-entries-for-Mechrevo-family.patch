@@ -1,0 +1,117 @@
+From 5bc73032f65ad42daba55b589d04a7d5d51fa6af Mon Sep 17 00:00:00 2001
+From: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 00:35:32 +0800
+Subject: [PATCH] quirks: add DMI entries for Mechrevo family
+
+Mechrevo laptops share the Uniwill / Tongfang ODM designs with
+Tuxedo Stellaris and Polaris series across both AMD and Intel platforms.
+
+Add MECHREVO sys/board/chassis vendor strings to the compatibility check
+allowlist, map Mechrevo AMD (GM5HG0A) and Intel (GM5IXxA, GM6IXxB) models
+to the respective TDP boundary definition tables in tuxedo_io, and enable
+auto boot, powershare, and custom profile quirks in uniwill_keyboard.
+
+Signed-off-by: Railgun-wiki <64968531+Railgun-wiki@users.noreply.github.com>
+---
+ .../tuxedo_compatibility_check.c              | 19 +++++++++++++++++++
+ src/tuxedo_io/tuxedo_io.c                     | 18 +++++++++++++-----
+ src/uniwill_keyboard.h                        |  8 +++++++-
+ 3 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/src/tuxedo_compatibility_check/tuxedo_compatibility_check.c b/src/tuxedo_compatibility_check/tuxedo_compatibility_check.c
+index ec6fd1a..26d49f3 100644
+--- a/src/tuxedo_compatibility_check/tuxedo_compatibility_check.c
++++ b/src/tuxedo_compatibility_check/tuxedo_compatibility_check.c
+@@ -216,6 +216,25 @@ static const struct dmi_system_id tuxedo_dmi_string_match[] = {
+ 			DMI_MATCH(DMI_CHASSIS_VENDOR, "TUXEDO"),
+ 		},
+ 	},
++	/*
++	 * Allow Mechrevo devices sharing Tongfang/Uniwill ODM designs
++	 * to pass driver compatibility validation.
++	 */
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "MECHREVO"),
++		},
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "MECHREVO"),
++		},
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_CHASSIS_VENDOR, "MECHREVO"),
++		},
++	},
+ 	{ }
+ };
+ 
+diff --git a/src/tuxedo_io/tuxedo_io.c b/src/tuxedo_io/tuxedo_io.c
+index 3220c60..4f016ed 100644
+--- a/src/tuxedo_io/tuxedo_io.c
++++ b/src/tuxedo_io/tuxedo_io.c
+@@ -220,21 +220,29 @@ static void uw_id_tdp(void)
+ 	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS1XA05")) {
+ 		tdp_min_defs = tdp_min_gmxxgxx;
+ 		tdp_max_defs = tdp_max_gmxxgxx;
+-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") &&
++	} else if ((dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") ||
++		    dmi_match(DMI_SYS_VENDOR, "MECHREVO")) &&
+ 		   dmi_match(DMI_BOARD_NAME, "GM6IXxB_MB1")) {
+ 		tdp_min_defs = tdp_min_gmxixxb_mb1;
+ 		tdp_max_defs = tdp_max_gmxixxb_mb1;
+-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") &&
++	} else if ((dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I06") ||
++		    dmi_match(DMI_SYS_VENDOR, "MECHREVO")) &&
+ 		   dmi_match(DMI_BOARD_NAME, "GM6IXxB_MB2")) {
+ 		tdp_min_defs = tdp_min_gmxixxb_mb2;
+ 		tdp_max_defs = tdp_max_gmxixxb_mb2;
+-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS17I06")) {
++	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS17I06") ||
++		   (dmi_match(DMI_SYS_VENDOR, "MECHREVO") &&
++		    dmi_match(DMI_BOARD_NAME, "GM6IXxB"))) {
+ 		tdp_min_defs = tdp_min_gmxixxn;
+ 		tdp_max_defs = tdp_max_gmxixxn;
+-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15I06")) {
++	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15I06") ||
++		   dmi_match(DMI_BOARD_NAME, "GM5IXxA") ||
++		   dmi_match(DMI_BOARD_NAME, "GM5IX0A")) {
+ 		tdp_min_defs = tdp_min_gmxixxa;
+ 		tdp_max_defs = tdp_max_gmxixxa;
+-	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15A06")) {
++	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLSL15A06")
++		   || dmi_match(DMI_BOARD_NAME, "GM5HG0A")
++		   || dmi_match(DMI_PRODUCT_NAME, "yilong15 Pro Series GM5HG0A")) {
+ 		tdp_min_defs = tdp_min_gmxhgxa;
+ 		tdp_max_defs = tdp_max_gmxhgxa;
+ 	} else if (dmi_match(DMI_PRODUCT_SKU, "STELLARIS16I07")) {
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+index b5968d7..c3216ae 100644
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -977,9 +977,12 @@ static int is_auto_boot_and_powershare_supported(bool *status)
+ 		  dmi_match(DMI_BOARD_NAME, "X6AR5xxY_mLED") ||
+ 		  dmi_match(DMI_BOARD_NAME, "X6FR5xxY") ||
+ 
+-		  // Stellaris Slim Gen6
++		  // Stellaris Slim Gen6 & Mechrevo family
+ 		  dmi_match(DMI_BOARD_NAME, "GMxHGxx") ||
++		  dmi_match(DMI_BOARD_NAME, "GM5HG0A") ||
++		  dmi_match(DMI_PRODUCT_NAME, "yilong15 Pro Series GM5HG0A") ||
+ 		  dmi_match(DMI_BOARD_NAME, "GM5IXxA") ||
++		  dmi_match(DMI_BOARD_NAME, "GM5IX0A") ||
+ 
+ 		  // InfinityBook Max Gen10
+ 		  dmi_match(DMI_BOARD_NAME, "X5KK45xS_X5SP45xS");
+@@ -1752,6 +1755,9 @@ struct uniwill_device_features_t *uniwill_get_device_features(void)
+ 		|| dmi_match(DMI_PRODUCT_SKU, "STELLARIS16A07")
+ 		|| dmi_match(DMI_PRODUCT_SKU, "STELLSL15I06")
+ 		|| dmi_match(DMI_PRODUCT_SKU, "STELLSL15A06")
++		|| dmi_match(DMI_SYS_VENDOR, "MECHREVO")
++		|| dmi_match(DMI_BOARD_NAME, "GM5HG0A")
++		|| dmi_match(DMI_PRODUCT_NAME, "yilong15 Pro Series GM5HG0A")
+ 		|| dmi_match(DMI_BOARD_NAME, "GXxMRXx")
+ 		|| dmi_match(DMI_BOARD_NAME, "GXxHRXx")
+ 		|| dmi_match(DMI_BOARD_NAME, "XxHP4NAx")

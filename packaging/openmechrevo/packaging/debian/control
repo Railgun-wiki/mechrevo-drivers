@@ -1,0 +1,18 @@
+Source: mechrevo-drivers-dkms
+Section: kernel
+Priority: optional
+Maintainer: OpenMechrevo Authors <dev@openmechrevo.org>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/OpenMechrevo/OpenMechrevo
+
+Package: mechrevo-drivers-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms
+Provides: tuxedo-drivers-dkms
+Conflicts: tuxedo-drivers-dkms
+Description: Kernel driver modules for Mechrevo laptops (DKMS)
+ This package provides DKMS support for Mechrevo GM5HG0A and compatible
+ laptops based on Tuxedo drivers with minimal incremental adaptations.
+ Includes support for performance profile switching, status LED control,
+ AMD TDP limits, and 11-point hardware fan curves.

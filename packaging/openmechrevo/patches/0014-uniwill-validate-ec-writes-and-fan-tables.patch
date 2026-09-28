@@ -1,0 +1,1081 @@
+From: OpenMechrevo Authors <dev@openmechrevo.org>
+Subject: [PATCH 14/14] uniwill: validate EC writes and fan tables
+
+diff --git a/src/uniwill_keyboard.h b/src/uniwill_keyboard.h
+--- a/src/uniwill_keyboard.h
++++ b/src/uniwill_keyboard.h
+@@ -346,7 +346,8 @@
+ 	struct uniwill_device_features_t *uw_feats = uniwill_get_device_features();
+ 	if (uw_feats->uniwill_custom_profile_mode_needed) {
+ 		u8 data;
+-		uniwill_read_ec_ram(UW_EC_REG_CUSTOM_PROFILE, &data);
++		if (uniwill_read_ec_ram(UW_EC_REG_CUSTOM_PROFILE, &data))
++			return;
+ 		if (zero_bit_initially) {
+ 			// Certain devices seem to need this first reset to zero on boot to have it properly applied
+ 			data &= ~(1 << 6);
+@@ -2199,6 +2200,23 @@
+ #endif
+ #endif
+ 
++static DEFINE_MUTEX(uniwill_mechrevo_ec_lock);
++
++static int uniwill_checked_ec_write(u16 addr, u8 value)
++{
++	u8 readback;
++	int ret = uniwill_write_ec_ram(addr, value);
++
++	if (!ret)
++		ret = uniwill_read_ec_ram(addr, &readback);
++	if (!ret && readback != value)
++		ret = -EIO;
++	if (ret)
++		pr_err("EC write/readback failed at 0x%04x (wanted 0x%02x): %d\n",
++		       addr, value, ret);
++	return ret;
++}
++
+ static void uniwill_notify_platform_profile(void)
+ {
+ #if IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)
+@@ -2236,43 +2254,37 @@
+ static int uniwill_set_perf_mode_info(u8 base_mode, u8 led_mode, bool custom)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	u8 cur_perf = 0, cflag = 0, lflag = 0, led_val = 0;
+-	int ret;
+-
+-	/* 1. Read current perf register to preserve bit 6 (FanBoost) */
+-	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &cur_perf);
+-	if (ret)
+-		return ret;
+-
+-	cur_perf = (cur_perf & 0x40) | (base_mode & ~0x40);
+-	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, cur_perf);
+-	if (ret)
+-		return ret;
+-
+-	/* 2. Configure custom flags in 0x0726 (bit 7) and 0x0727 (bit 6) */
+-	if (uniwill_read_ec_ram(0x0726, &cflag) == 0) {
+-		if (custom)
+-			cflag |= BIT(7);
+-		else
+-			cflag &= ~BIT(7);
+-		uniwill_write_ec_ram(0x0726, cflag);
+-	}
+-	if (uniwill_read_ec_ram(0x0727, &lflag) == 0) {
+-		if (custom)
+-			lflag |= BIT(6);
+-		else
+-			lflag &= ~BIT(6);
+-		uniwill_write_ec_ram(0x0727, lflag);
+-	}
+-
+-	/* 3. Synchronize power LED status bits 1:0 preserving other bits */
+-	if (uniwill_read_ec_ram(regmap->reg_power_led, &led_val) == 0) {
+-		led_val = (led_val & ~0x03) | (led_mode & 0x03);
+-		uniwill_write_ec_ram(regmap->reg_power_led, led_val);
+-	}
+-
++	const u16 addrs[] = { regmap->reg_perf_mode, 0x0726, 0x0727,
++			      regmap->reg_power_led };
++	u8 previous[ARRAY_SIZE(addrs)], values[ARRAY_SIZE(addrs)];
++	int i, ret;
++
++	mutex_lock(&uniwill_mechrevo_ec_lock);
++	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
++		ret = uniwill_read_ec_ram(addrs[i], &previous[i]);
++		if (ret)
++			goto out;
++	}
++	values[0] = (previous[0] & BIT(6)) | (base_mode & ~BIT(6));
++	values[1] = custom ? previous[1] | BIT(7) : previous[1] & ~BIT(7);
++	values[2] = custom ? previous[2] | BIT(6) : previous[2] & ~BIT(6);
++	values[3] = (previous[3] & ~0x03) | (led_mode & 0x03);
++	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
++		ret = uniwill_checked_ec_write(addrs[i], values[i]);
++		if (ret)
++			goto restore;
++	}
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
+ 	uniwill_notify_platform_profile();
+ 	return 0;
++
++restore:
++	/* Best effort: failure is always returned, even when rollback succeeds. */
++	for (; i >= 0; i--)
++		uniwill_checked_ec_write(addrs[i], previous[i]);
++out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret;
+ }
+ 
+ static ssize_t perf_mode_show(struct device *dev,
+@@ -2373,20 +2385,25 @@
+ 	if (kstrtou8(buf, 0, &mode) || mode > 3)
+ 		return -EINVAL;
+ 
++	mutex_lock(&uniwill_mechrevo_ec_lock);
+ 	ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	val = (val & ~0x03) | (mode & 0x03);
+ 	ret = uniwill_write_ec_ram(regmap->reg_power_led, val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	ret = uniwill_read_ec_ram(regmap->reg_power_led, &readback);
+-	if (ret || (readback & 0x03) != (mode & 0x03))
+-		return -EIO;
+-
+-	return count;
++	if (ret)
++		goto out;
++	if ((readback & 0x03) != (mode & 0x03))
++		ret = -EIO;
++
++	out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_RW(power_led_mode);
+ 
+@@ -2612,10 +2629,26 @@
+ 	.attrs = uniwill_perf_attrs,
+ };
+ 
+-/*
+- * AMD CPU power limits (TDP SPL / sPPT / fPPT) and thermal ceiling (TCC offset).
+- * Writes are clamped within model boundaries, with post-write readback verification.
++/* CPU power limits (SPL / sPPT / fPPT) and vendor-specific EC 0x0786.
++ * Power writes clamp to model limits; 0x0786 rejects out-of-range values.
+  */
++
++static int uniwill_write_power_limit(u16 addr, u8 value)
++{
++	u8 previous;
++	int ret;
++
++	mutex_lock(&uniwill_mechrevo_ec_lock);
++	ret = uniwill_read_ec_ram(addr, &previous);
++	if (ret)
++		goto out;
++	ret = uniwill_checked_ec_write(addr, value);
++	if (ret && uniwill_checked_ec_write(addr, previous))
++		pr_err("Could not restore EC power limit at 0x%04x\n", addr);
++out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret;
++}
+ 
+ static ssize_t tdp_spl_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+@@ -2633,20 +2666,15 @@
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	unsigned int val;
+-	u8 readback = 0;
+ 	int ret;
+ 
+ 	if (kstrtouint(buf, 0, &val))
+ 		return -EINVAL;
+ 
+ 	val = clamp_val(val, regmap->tdp_spl_min, regmap->tdp_spl_max);
+-	ret = uniwill_write_ec_ram(regmap->reg_tdp_spl, (u8)val);
++	ret = uniwill_write_power_limit(regmap->reg_tdp_spl, (u8)val);
+ 	if (ret)
+ 		return ret;
+-
+-	ret = uniwill_read_ec_ram(regmap->reg_tdp_spl, &readback);
+-	if (ret || readback != (u8)val)
+-		return -EIO;
+ 
+ 	return count;
+ }
+@@ -2684,20 +2712,15 @@
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	unsigned int val;
+-	u8 readback = 0;
+ 	int ret;
+ 
+ 	if (kstrtouint(buf, 0, &val))
+ 		return -EINVAL;
+ 
+ 	val = clamp_val(val, regmap->tdp_sppt_min, regmap->tdp_sppt_max);
+-	ret = uniwill_write_ec_ram(regmap->reg_tdp_sppt, (u8)val);
++	ret = uniwill_write_power_limit(regmap->reg_tdp_sppt, (u8)val);
+ 	if (ret)
+ 		return ret;
+-
+-	ret = uniwill_read_ec_ram(regmap->reg_tdp_sppt, &readback);
+-	if (ret || readback != (u8)val)
+-		return -EIO;
+ 
+ 	return count;
+ }
+@@ -2740,7 +2763,7 @@
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	unsigned int val;
+-	u8 write_val = 0, readback = 0;
++	u8 write_val = 0;
+ 	bool double_pl4 = false;
+ 	int ret;
+ 
+@@ -2754,13 +2777,9 @@
+ 	else
+ 		write_val = (u8)val;
+ 
+-	ret = uniwill_write_ec_ram(regmap->reg_tdp_fppt, write_val);
++	ret = uniwill_write_power_limit(regmap->reg_tdp_fppt, write_val);
+ 	if (ret)
+ 		return ret;
+-
+-	ret = uniwill_read_ec_ram(regmap->reg_tdp_fppt, &readback);
+-	if (ret || readback != write_val)
+-		return -EIO;
+ 
+ 	return count;
+ }
+@@ -2798,21 +2817,20 @@
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+ 	unsigned int val;
+-	u8 readback = 0;
+ 	int ret;
+ 
+ 	if (kstrtouint(buf, 0, &val))
+ 		return -EINVAL;
+ 
+-	val = clamp_val(val, regmap->tcc_offset_min, regmap->tcc_offset_max);
+-	/* Write target temperature with bit 7 asserted as hardware enable flag */
+-	ret = uniwill_write_ec_ram(regmap->reg_tcc_offset, (u8)val | 0x80);
++	if (regmap->cpu_vendor != UNIWILL_CPU_AMD &&
++	    regmap->cpu_vendor != UNIWILL_CPU_INTEL)
++		return -EOPNOTSUPP;
++	if (val < regmap->tcc_offset_min || val > regmap->tcc_offset_max)
++		return -ERANGE;
++	/* AMD: absolute degrees C; Intel: degrees below TjMax. */
++	ret = uniwill_write_power_limit(regmap->reg_tcc_offset, (u8)val | 0x80);
+ 	if (ret)
+ 		return ret;
+-
+-	ret = uniwill_read_ec_ram(regmap->reg_tcc_offset, &readback);
+-	if (ret || (readback & 0x7f) != (u8)val)
+-		return -EIO;
+ 
+ 	return count;
+ }
+@@ -2866,10 +2884,8 @@
+ 	.is_visible = uniwill_tdp_attr_is_visible,
+ };
+ 
+-/*
+- * 11-point hardware fan curve tables and fan boost control.
+- * [UNVERIFIED]: Writes 11 temperature/duty triplets directly into EC fan tables.
+- * Kernel exposes down/upload primitives only; curves are driven by userspace.
++/* 16-point EC fan curves. The kernel validates complete tables and verifies
++ * EC writes; userspace remains responsible for choosing the temperature curve.
+  */
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+@@ -2878,55 +2894,179 @@
+ #define UW_BIN_ATTR_ARG struct bin_attribute *
+ #endif
+ 
++/* Each physical table is 48 (1p5) or 80 (2p0) bytes.  The logical
++ * ABI exposes 16 {up, down, duty} triplets for each independently driven fan.
++ * Slot 15 DownT aliases slot 14: the physical DownT[0] is reserved.
++ */
++static int uniwill_validate_fan_curve(const u8 *curve)
++{
++	int i, last = -1;
++	bool padding = false, cooling = false;
++
++	if (curve[0] != 0 || curve[1] != 0 || curve[43] != curve[46])
++		return -EINVAL;
++	for (i = 0; i < 16; i++) {
++		u8 up = curve[3 * i], down = curve[3 * i + 1];
++		u8 duty = curve[3 * i + 2];
++
++		if (duty > 100)
++			return -ERANGE;
++		if (i == 0)
++			continue;
++		if (up == 0xff) {
++			padding = true;
++			if (duty != 100)
++				return -EINVAL;
++			continue;
++		}
++		if (padding || up > 110 || up <= last || down >= up ||
++		    up - down < 3 || up - down > 15)
++			return -EINVAL;
++		cooling = up >= 85 && duty >= 80;
++		last = up;
++	}
++	return cooling ? 0 : -EINVAL;
++}
++
++static int uniwill_fan_write_byte(u16 addr, u8 value)
++{
++	return uniwill_checked_ec_write(addr, value);
++}
++
++static ssize_t uniwill_fan_curve_read(u16 base,
++		const struct uniwill_ec_regmap *regmap,
++		char *buf, loff_t off, size_t count)
++{
++	u8 curve[48] = { 0 };
++	u8 val;
++	int i, ret;
++
++	if (off < 0)
++		return -EINVAL;
++	if (off >= sizeof(curve))
++		return 0;
++	count = min_t(size_t, count, sizeof(curve) - off);
++	mutex_lock(&uniwill_mechrevo_ec_lock);
++	for (i = 0; i < 16; i++) {
++		if (i) {
++			ret = uniwill_read_ec_ram(base + i - 1, &curve[i * 3]);
++			if (ret)
++				goto out;
++		}
++		ret = uniwill_read_ec_ram(base + regmap->fan_down_temp_offset +
++					 min(i + 1, 15), &curve[i * 3 + 1]);
++		if (ret)
++			goto out;
++		ret = uniwill_read_ec_ram(base + regmap->fan_duty_offset + i, &val);
++		if (ret)
++			goto out;
++		curve[i * 3 + 2] = regmap->fan_duty_scale ?
++				val / regmap->fan_duty_scale : val;
++	}
++	memcpy(buf, curve + off, count);
++	ret = count;
++out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret;
++}
++
++static ssize_t uniwill_fan_curve_write(u16 base,
++		const struct uniwill_ec_regmap *regmap,
++		const char *buf, loff_t off, size_t count)
++{
++	u8 previous[80], en5, en6, value;
++	int i, j, size, ret, restore_ret = 0;
++
++	if (off != 0 || count != 48 || regmap->fan_points != 16 ||
++	    (regmap->fan_table_layout != 1 && regmap->fan_table_layout != 2))
++		return -EINVAL;
++	ret = uniwill_validate_fan_curve(buf);
++	if (ret)
++		return ret;
++	size = regmap->fan_table_layout == 2 ? 80 : 48;
++	mutex_lock(&uniwill_mechrevo_ec_lock);
++	ret = uniwill_read_ec_ram(0x07C5, &en5);
++	if (ret)
++		goto out;
++	ret = uniwill_read_ec_ram(0x07C6, &en6);
++	if (ret)
++		goto out;
++	for (i = 0; i < size; i++) {
++		ret = uniwill_read_ec_ram(base + i, &previous[i]);
++		if (ret)
++			goto out;
++	}
++	/* Stop consuming the table while its bytes are being replaced. */
++	ret = uniwill_checked_ec_write(0x07C5, en5 & ~BIT(7));
++	if (ret)
++		goto restore_flags;
++	ret = uniwill_checked_ec_write(0x07C6, en6 & ~BIT(2));
++	if (ret)
++		goto restore_flags;
++	/* FanTable2p0 also has two GPU temperature planes per fan. They
++	 * are not represented by this CPU-temperature ABI and must remain
++	 * untouched rather than being overwritten with CPU thresholds.
++	 */
++	for (i = 0; i < 48; i++) {
++		j = i & 15;
++		switch (i / 16) {
++		case 0:
++			value = j == 15 ? 0xff : buf[(j + 1) * 3];
++			break;
++		case 1:
++			value = j == 0 ? 0 : buf[(j - 1) * 3 + 1];
++			break;
++		default:
++			value = buf[j * 3 + 2] *
++				(regmap->fan_duty_scale ? regmap->fan_duty_scale : 1);
++		}
++		ret = uniwill_fan_write_byte(base + i, value);
++		if (ret)
++			goto restore;
++	}
++	ret = uniwill_checked_ec_write(0x07C6, en6 | BIT(2));
++	if (!ret)
++		ret = uniwill_checked_ec_write(0x07C5, en5 | BIT(7));
++	if (!ret) {
++		mutex_unlock(&uniwill_mechrevo_ec_lock);
++		return count;
++	}
++restore:
++	/* Disable table consumption even if the enable write partly succeeded. */
++	if (uniwill_checked_ec_write(0x07C5, en5 & ~BIT(7)))
++		restore_ret = -EIO;
++	if (uniwill_checked_ec_write(0x07C6, en6 & ~BIT(2)))
++		restore_ret = -EIO;
++	/* Never reactivate a partially restored table. */
++	for (i = 0; i < size; i++)
++		if (uniwill_checked_ec_write(base + i, previous[i]))
++			restore_ret = -EIO;
++	if (restore_ret)
++		pr_err("EC fan table rollback failed at 0x%04x; table left disabled\n",
++		       base);
++restore_flags:
++	if (restore_ret)
++		goto out;
++	if (uniwill_checked_ec_write(0x07C6, en6))
++		pr_err("EC fan enable rollback failed at 0x07c6\n");
++	if (uniwill_checked_ec_write(0x07C5, en5))
++		pr_err("EC fan control rollback failed at 0x07c5\n");
++out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret;
++}
++
+ static ssize_t fan_curve1_read(struct file *filp, struct kobject *kobj,
+ 			       UW_BIN_ATTR_ARG bin_attr,
+ 			       char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 1 || !regmap->reg_fan_curve_cpu)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off >= total_size)
+-		return 0;
+-	if (off + count > total_size)
+-		count = total_size - off;
+-
+-	for (i = 0; i < regmap->fan_points; i++) {
+-		u8 upt = 0, downt = 0, duty = 0;
+-
+-		if (i * 3 + 2 < off || i * 3 >= off + count)
+-			continue;
+-
+-		/* Point 0 UpT is 0 C base; points 1..10 read from offsets 0..9 */
+-		if (i == 0) {
+-			upt = 0;
+-		} else {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_cpu + i - 1, &upt);
+-		}
+-
+-		/* DownT for point i is in EC offset i + 1 (clamp slot 15 to offset 15 to stay within DownT table) */
+-		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+-				    regmap->fan_down_temp_offset + down_idx, &downt);
+-
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_cpu +
+-				    regmap->fan_duty_offset + i, &duty);
+-		if (regmap->fan_duty_scale)
+-			duty /= regmap->fan_duty_scale;
+-
+-		if (i * 3 >= off && i * 3 < off + count)
+-			buf[i * 3 - off] = upt;
+-		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
+-			buf[i * 3 + 1 - off] = downt;
+-		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
+-			buf[i * 3 + 2 - off] = duty;
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_read(regmap->reg_fan_curve_cpu,
++					regmap, buf, off, count);
+ }
+ 
+ static ssize_t fan_curve1_write(struct file *filp, struct kobject *kobj,
+@@ -2934,73 +3074,12 @@
+ 				char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 1 || !regmap->reg_fan_curve_cpu)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off != 0 || count != total_size)
+-		return -EINVAL;
+-
+-	/* UpT: Points 1..regmap->fan_points-1 written to offsets 0..regmap->fan_points-2; rest clamped to 0xFF */
+-	for (i = 0; i < 16; i++) {
+-		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu + i, upt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
+-					     regmap->fan_gpu_up_temp_offset + i, upt_val);
+-	}
+-
+-	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+-	for (i = 0; i < 16; i++) {
+-		u8 downt_val;
+-		if (i == 0)
+-			downt_val = 0;
+-		else if (i <= regmap->fan_points)
+-			downt_val = buf[(i - 1) * 3 + 1];
+-		else
+-			downt_val = 0xFF;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
+-				     regmap->fan_down_temp_offset + i, downt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
+-					     regmap->fan_gpu_down_temp_offset + i, downt_val);
+-	}
+-
+-	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+-	for (i = 0; i < 16; i++) {
+-		u8 duty_val;
+-		if (i < regmap->fan_points) {
+-			u8 d = buf[i * 3 + 2];
+-			if (d > 100)
+-				d = 100;
+-			duty_val = regmap->fan_duty_scale ?
+-				(d * regmap->fan_duty_scale) : d;
+-		} else {
+-			duty_val = regmap->fan_duty_scale ?
+-				(100 * regmap->fan_duty_scale) : 100;
+-		}
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_cpu +
+-				     regmap->fan_duty_offset + i, duty_val);
+-	}
+-
+-	/* Assert RAM fan table enable (0x07C6 bit 2) and respective control (0x07C5 bit 7) */
+-	{
+-		u8 en_val = 0;
+-
+-		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
+-			en_val |= BIT(2);
+-			uniwill_write_ec_ram(0x07C6, en_val);
+-		}
+-		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
+-			en_val |= BIT(7);
+-			uniwill_write_ec_ram(0x07C5, en_val);
+-		}
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_write(regmap->reg_fan_curve_cpu,
++					regmap, buf, off, count);
+ }
+ 
+ static struct bin_attribute bin_attr_fan_curve1 = {
+@@ -3015,50 +3094,12 @@
+ 			       char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 2 || !regmap->reg_fan_curve_gpu)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off >= total_size)
+-		return 0;
+-	if (off + count > total_size)
+-		count = total_size - off;
+-
+-	for (i = 0; i < regmap->fan_points; i++) {
+-		u8 upt = 0, downt = 0, duty = 0;
+-
+-		if (i * 3 + 2 < off || i * 3 >= off + count)
+-			continue;
+-
+-		/* Point 0 UpT is 0 C base; points 1..10 read from offsets 0..9 */
+-		if (i == 0) {
+-			upt = 0;
+-		} else {
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_gpu + i - 1, &upt);
+-		}
+-
+-		/* DownT for point i is in EC offset i + 1 (clamp slot 15 to offset 15 to stay within DownT table) */
+-		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+-				    regmap->fan_down_temp_offset + down_idx, &downt);
+-
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_gpu +
+-				    regmap->fan_duty_offset + i, &duty);
+-		if (regmap->fan_duty_scale)
+-			duty /= regmap->fan_duty_scale;
+-
+-		if (i * 3 >= off && i * 3 < off + count)
+-			buf[i * 3 - off] = upt;
+-		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
+-			buf[i * 3 + 1 - off] = downt;
+-		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
+-			buf[i * 3 + 2 - off] = duty;
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_read(regmap->reg_fan_curve_gpu,
++					regmap, buf, off, count);
+ }
+ 
+ static ssize_t fan_curve2_write(struct file *filp, struct kobject *kobj,
+@@ -3066,73 +3107,12 @@
+ 				char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || !regmap->has_fan_table || regmap->fan_points == 0)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 2 || !regmap->reg_fan_curve_gpu)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off != 0 || count != total_size)
+-		return -EINVAL;
+-
+-	/* UpT: Points 1..regmap->fan_points-1 written to offsets 0..regmap->fan_points-2; rest clamped to 0xFF */
+-	for (i = 0; i < 16; i++) {
+-		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu + i, upt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
+-					     regmap->fan_gpu_up_temp_offset + i, upt_val);
+-	}
+-
+-	/* DownT: Points 0..regmap->fan_points-1 written to offsets 1..regmap->fan_points; offset 0 set to 0 */
+-	for (i = 0; i < 16; i++) {
+-		u8 downt_val;
+-		if (i == 0)
+-			downt_val = 0;
+-		else if (i <= regmap->fan_points)
+-			downt_val = buf[(i - 1) * 3 + 1];
+-		else
+-			downt_val = 0xFF;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
+-				     regmap->fan_down_temp_offset + i, downt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
+-					     regmap->fan_gpu_down_temp_offset + i, downt_val);
+-	}
+-
+-	/* Duty: Points 0..regmap->fan_points-1 scaled; rest clamped to 100 * scale */
+-	for (i = 0; i < 16; i++) {
+-		u8 duty_val;
+-		if (i < regmap->fan_points) {
+-			u8 d = buf[i * 3 + 2];
+-			if (d > 100)
+-				d = 100;
+-			duty_val = regmap->fan_duty_scale ?
+-				(d * regmap->fan_duty_scale) : d;
+-		} else {
+-			duty_val = regmap->fan_duty_scale ?
+-				(100 * regmap->fan_duty_scale) : 100;
+-		}
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_gpu +
+-				     regmap->fan_duty_offset + i, duty_val);
+-	}
+-
+-	/* Assert RAM fan table enable (0x07C6 bit 2) and respective control (0x07C5 bit 7) */
+-	{
+-		u8 en_val = 0;
+-
+-		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
+-			en_val |= BIT(2);
+-			uniwill_write_ec_ram(0x07C6, en_val);
+-		}
+-		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
+-			en_val |= BIT(7);
+-			uniwill_write_ec_ram(0x07C5, en_val);
+-		}
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_write(regmap->reg_fan_curve_gpu,
++					regmap, buf, off, count);
+ }
+ 
+ static struct bin_attribute bin_attr_fan_curve2 = {
+@@ -3147,42 +3127,12 @@
+ 			       char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off >= total_size)
+-		return 0;
+-	if (off + count > total_size)
+-		count = total_size - off;
+-
+-	for (i = 0; i < regmap->fan_points; i++) {
+-		u8 upt = 0, downt = 0, duty = 0;
+-		u8 down_idx = (i < regmap->fan_points - 1) ? (i + 1) : i;
+-
+-		if (i * 3 + 2 < off || i * 3 >= off + count)
+-			continue;
+-		if (i > 0)
+-			uniwill_read_ec_ram(regmap->reg_fan_curve_mid + i - 1, &upt);
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_mid +
+-				    regmap->fan_down_temp_offset + down_idx, &downt);
+-		uniwill_read_ec_ram(regmap->reg_fan_curve_mid +
+-				    regmap->fan_duty_offset + i, &duty);
+-		if (regmap->fan_duty_scale)
+-			duty /= regmap->fan_duty_scale;
+-
+-		if (i * 3 >= off && i * 3 < off + count)
+-			buf[i * 3 - off] = upt;
+-		if (i * 3 + 1 >= off && i * 3 + 1 < off + count)
+-			buf[i * 3 + 1 - off] = downt;
+-		if (i * 3 + 2 >= off && i * 3 + 2 < off + count)
+-			buf[i * 3 + 2 - off] = duty;
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_read(regmap->reg_fan_curve_mid,
++					regmap, buf, off, count);
+ }
+ 
+ static ssize_t fan_curve3_write(struct file *filp, struct kobject *kobj,
+@@ -3190,58 +3140,12 @@
+ 				char *buf, loff_t off, size_t count)
+ {
+ 	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
+-	size_t total_size;
+-	int i;
+-
+-	if (!regmap || regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
++
++	if (!regmap || !regmap->has_fan_table ||
++	    regmap->fan_channels < 3 || !regmap->reg_fan_curve_mid)
+ 		return -EOPNOTSUPP;
+-
+-	total_size = regmap->fan_points * 3;
+-	if (off != 0 || count != total_size)
+-		return -EINVAL;
+-
+-	for (i = 0; i < 16; i++) {
+-		u8 upt_val = (i < regmap->fan_points - 1) ? buf[(i + 1) * 3] : 0xFF;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_mid + i, upt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
+-					     regmap->fan_gpu_up_temp_offset + i, upt_val);
+-	}
+-
+-	for (i = 0; i < 16; i++) {
+-		u8 downt_val = i == 0 ? 0 : buf[(i - 1) * 3 + 1];
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
+-				     regmap->fan_down_temp_offset + i, downt_val);
+-		if (regmap->fan_table_layout == 2)
+-			uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
+-					     regmap->fan_gpu_down_temp_offset + i, downt_val);
+-	}
+-
+-	for (i = 0; i < 16; i++) {
+-		u8 duty = buf[i * 3 + 2];
+-
+-		if (duty > 100)
+-			duty = 100;
+-		if (regmap->fan_duty_scale)
+-			duty *= regmap->fan_duty_scale;
+-		uniwill_write_ec_ram(regmap->reg_fan_curve_mid +
+-				     regmap->fan_duty_offset + i, duty);
+-	}
+-
+-	{
+-		u8 en_val = 0;
+-
+-		if (uniwill_read_ec_ram(0x07C6, &en_val) == 0) {
+-			en_val |= BIT(2);
+-			uniwill_write_ec_ram(0x07C6, en_val);
+-		}
+-		if (uniwill_read_ec_ram(0x07C5, &en_val) == 0) {
+-			en_val |= BIT(7);
+-			uniwill_write_ec_ram(0x07C5, en_val);
+-		}
+-	}
+-
+-	return count;
++	return uniwill_fan_curve_write(regmap->reg_fan_curve_mid,
++					regmap, buf, off, count);
+ }
+ 
+ static struct bin_attribute bin_attr_fan_curve3 = {
+@@ -3273,9 +3177,10 @@
+ 	if (kstrtobool(buf, &enable))
+ 		return -EINVAL;
+ 
++	mutex_lock(&uniwill_mechrevo_ec_lock);
+ 	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	if (enable)
+ 		val |= BIT(6);
+@@ -3284,13 +3189,17 @@
+ 
+ 	ret = uniwill_write_ec_ram(regmap->reg_perf_mode, val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	ret = uniwill_read_ec_ram(regmap->reg_perf_mode, &readback);
+-	if (ret || !!(readback & BIT(6)) != enable)
+-		return -EIO;
+-
+-	return count;
++	if (ret)
++		goto out;
++	if (!!(readback & BIT(6)) != enable)
++		ret = -EIO;
++
++	out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_RW(fan_boost);
+ 
+@@ -3316,9 +3225,10 @@
+ 	if (kstrtobool(buf, &enable))
+ 		return -EINVAL;
+ 
++	mutex_lock(&uniwill_mechrevo_ec_lock);
+ 	ret = uniwill_read_ec_ram(regmap->reg_power_led, &val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	if (enable)
+ 		val |= BIT(4);
+@@ -3327,13 +3237,17 @@
+ 
+ 	ret = uniwill_write_ec_ram(regmap->reg_power_led, val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	ret = uniwill_read_ec_ram(regmap->reg_power_led, &readback);
+-	if (ret || !!(readback & BIT(4)) != enable)
+-		return -EIO;
+-
+-	return count;
++	if (ret)
++		goto out;
++	if (!!(readback & BIT(4)) != enable)
++		ret = -EIO;
++
++	out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_RW(over_boost);
+ 
+@@ -3379,13 +3293,10 @@
+ };
+ 
+ /*
+- * Discrete GPU power rail status via ACPI AMW0.OEMG(0x0300).
+- *
+- * NOTE: Dynamic runtime power cutting without prior PCIe bus unbind and ACPI
+- * eject causes fatal PCIe Surprise Down AER kernel panic.
+- * Switching GPU display modes must be performed via UEFI MUX NVRAM variable
+- * and takes effect after system reboot.
+- * The dgpu_power attribute is strictly READ-ONLY (query status only).
++ * OEMG(0x0300, 1) requests firmware GPU eject and requires PEGP._PSC == 3
++ * before removing power.  A plain sysfs write cannot establish that Linux
++ * ACPI hotplug, DRM and all GPU functions have completed the eject handshake.
++ * Reject live power cuts until a verified hotplug orchestration is available.
+  */
+ 
+ static ssize_t dgpu_power_show(struct device *dev,
+@@ -3408,7 +3319,48 @@
+ 
+ 	return sysfs_emit(buf, "unknown (0x%02x)\n", status);
+ }
+-static DEVICE_ATTR_RO(dgpu_power);
++static ssize_t dgpu_power_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	const struct uniwill_ec_regmap *regmap = uniwill_get_active_regmap();
++	u8 state;
++	bool on;
++	int ret;
++
++	if (!regmap || !regmap->has_dgpu_power_cut)
++		return -EOPNOTSUPP;
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++	mutex_lock(&uniwill_mechrevo_ec_lock);
++	ret = uniwill_wmi_oemg(2, 0x0300, &state);
++	if (ret)
++		goto out;
++	if (state != 0x55 && state != 0xaa) {
++		ret = -EIO;
++		goto out;
++	}
++	if (!on && state == 0xaa) {
++		ret = -EOPNOTSUPP; /* _PSC eject handshake not proven safe. */
++		goto out;
++	}
++	if (on && state == 0x55) {
++		ret = uniwill_wmi_oemg(0, 0x0300, &state);
++		if (ret)
++			goto out;
++		ret = uniwill_wmi_oemg(2, 0x0300, &state);
++		if (ret || state != 0xaa) {
++			ret = -EIO;
++			goto out;
++		}
++	}
++	ret = count;
++out:
++	mutex_unlock(&uniwill_mechrevo_ec_lock);
++	return ret;
++}
++static DEVICE_ATTR_RW(dgpu_power);
+ 
+ static ssize_t mux_scheme_show(struct device *dev,
+ 			       struct device_attribute *attr,
+@@ -3471,21 +3423,18 @@
+ 
+ 	uw_feats = uniwill_get_device_features();
+ 
+-	/* Initialize performance mode register only if unset or invalid */
+-	{
+-		u8 cur_mode = 0;
+-
+-		if (uniwill_read_ec_ram(regmap->reg_perf_mode, &cur_mode) != 0 ||
+-		    ((cur_mode & 0xBF) != 0xa0 && (cur_mode & 0xBF) != 0x00 && (cur_mode & 0xBF) != 0x10))
+-			uniwill_write_ec_ram(regmap->reg_perf_mode, 0x00);
+-	}
++	/* Never overwrite an unknown or unreadable firmware mode on probe. */
+ 
+ 	if (uw_feats->uniwill_profile_v1 && (!regmap || !regmap->has_fan_table)) {
+ 		// Set manual-mode fan-curve in 0x0743 - 0x0747
+ 		// Some kind of default fan-curve is stored in 0x0786 - 0x078a: Using it to initialize manual-mode fan-curve
+ 		for (i = 0; i < 5; ++i) {
+-			uniwill_read_ec_ram(0x0786 + i, &data);
+-			uniwill_write_ec_ram(0x0743 + i, data);
++			status = uniwill_read_ec_ram(0x0786 + i, &data);
++			if (status)
++				return status;
++			status = uniwill_write_ec_ram(0x0743 + i, data);
++			if (status)
++				return status;
+ 		}
+ 	}
+ 
+diff --git a/src/uniwill_mechrevo_quirks.h b/src/uniwill_mechrevo_quirks.h
+--- a/src/uniwill_mechrevo_quirks.h
++++ b/src/uniwill_mechrevo_quirks.h
+@@ -230,8 +230,8 @@
+ 	.tdp_sppt_max = 160,
+ 	.tdp_fppt_min = 25,
+ 	.tdp_fppt_max = 175,
+-	.tcc_offset_min = 75,
+-	.tcc_offset_max = 100,
++	.tcc_offset_min = 0,
++	.tcc_offset_max = 20,
+ };
+ 
+ /* Model specific register mapping for Mechrevo 旷世16 Super (GM6IXxB) */
+@@ -270,8 +270,8 @@
+ 	.tdp_sppt_max = 160,
+ 	.tdp_fppt_min = 25,
+ 	.tdp_fppt_max = 175,
+-	.tcc_offset_min = 75,
+-	.tcc_offset_max = 100,
++	.tcc_offset_min = 0,
++	.tcc_offset_max = 20,
+ };
+ 
+ /* Model specific register mapping for Mechrevo 蛟龙16 (GMxRGxx) */
+diff --git a/Documentation/ABI/testing/sysfs-platform-mechrevo b/Documentation/ABI/testing/sysfs-platform-mechrevo
+--- a/Documentation/ABI/testing/sysfs-platform-mechrevo
++++ b/Documentation/ABI/testing/sysfs-platform-mechrevo
+@@ -65,9 +65,10 @@
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		CPU Temperature Control Circuit (TCC) target ceiling in deg C.
+-		Writing clamps the value between tcc_offset_min and tcc_offset_max
+-		and asserts bit 7 as the hardware enable flag (EC 0x0786).
++		CPU EC 0x0786: AMD models use an absolute target temperature
++		(degrees C); Intel models use degrees below TjMax (0..20).
++		Writing outside the model's min/max returns ERANGE instead of
++		clamping; bit 7 is asserted as the hardware enable flag.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_curve1
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_curve2
+@@ -78,13 +79,15 @@
+ Description:
+ 		Raw 16-point logical fan table attributes. FanTable1p5 exposes its
+ 		CPU/GPU channels as fan_curve1/fan_curve2. FanTable2p0 exposes physical
+-		fans 1/2/3 and mirrors each logical temperature ladder into that fan's
+-		CPU and GPU threshold blocks while keeping one duty block.
++		fans 1/2/3; its separate GPU threshold blocks are preserved unchanged.
+ 		Fixed size: 48 bytes (16 points * 3 bytes).
+ 		Layout per point: {u8 up_temp_c, u8 down_temp_c, u8 duty_percent}.
+-		Reading fetches the live CPU threshold and duty blocks. Writing programs
+-		all 16 slots and asserts RAM table enable (0x07C6 bit 2) and
+-		respective dual-fan control (0x07C5 bit 7).
++		Slot 15 down_temp aliases slot 14; both must agree. Writes require
++		strictly increasing active temperatures, a bounded hysteresis and a
++		high-temperature cooling point. The table is disabled while its CPU
++		threshold/duty bytes are written and read back; the previous bytes
++		and enable bits are restored on failure where EC access permits.
++		Successful writes assert 0x07C6 bit 2 and 0x07C5 bit 7.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/fan_boost
+ Date:		September 2026
+@@ -108,11 +111,12 @@
+ KernelVersion:	6.1
+ Contact:	OpenMechrevo Authors <dev@openmechrevo.org>
+ Description:
+-		Discrete GPU PCIe slot power status (READ-ONLY).
++		Discrete GPU PCIe slot power status and restricted restore control.
+ 		Reading calls ACPI AMW0.OEMG(0x0300, 2) and returns 1 if powered
+-		(0xAA) or 0 if cut (0x55). Dynamic power cut at runtime is disabled
+-		to prevent PCIe Surprise Down AER kernel panic. Display switching
+-		requires reboot via MUX NVRAM.
++		(0xAA) or 0 if cut (0x55). Writing 1 may restore an already-cut
++		rail and verifies its status. Writing 0 while powered returns
++		EOPNOTSUPP: a safe OS eject / firmware _PSC handshake is not yet
++		established. The reboot-time display MUX is separate from this rail.
+ 
+ What:		/sys/devices/platform/tuxedo_keyboard/mux_scheme
+ Date:		September 2026

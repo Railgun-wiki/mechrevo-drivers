@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+PACKAGE = mechrevo-drivers-dkms
+MODULE_NAME = mechrevo-drivers
+VERSION := $(shell dpkg-parsechangelog -S Version | cut -d- -f1)
+
+%:
+	dh $@ --with dkms
+
+override_dh_auto_install:
+	mkdir -p debian/$(PACKAGE)/usr/src/$(MODULE_NAME)-$(VERSION)
+	cp -r src/* debian/$(PACKAGE)/usr/src/$(MODULE_NAME)-$(VERSION)/
+	cp dkms.conf debian/$(PACKAGE)/usr/src/$(MODULE_NAME)-$(VERSION)/
+	sed -i 's/#MODULE_VERSION#/$(VERSION)/g' debian/$(PACKAGE)/usr/src/$(MODULE_NAME)-$(VERSION)/dkms.conf
+	install -Dm644 60-mechrevo.rules debian/$(PACKAGE)/usr/lib/udev/rules.d/60-mechrevo.rules
