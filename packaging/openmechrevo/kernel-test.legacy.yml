@@ -1,0 +1,46 @@
+name: Kernel patch Test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kernel-test.yml'
+      - '.gitmodules'
+      - 'submodules/tuxedo-drivers'
+      - 'kernel/**'
+      - 'hardware/archetypes/**'
+      - 'protocol/codegen/**'
+      - 'tests/test_kernel*.py'
+  pull_request:
+    paths:
+      - '.github/workflows/kernel-test.yml'
+      - '.gitmodules'
+      - 'submodules/tuxedo-drivers'
+      - 'kernel/**'
+      - 'hardware/archetypes/**'
+      - 'protocol/codegen/**'
+      - 'tests/test_kernel*.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic python3
+      - name: Verify generated header and patch parity
+        run: |
+          cargo run --manifest-path protocol/codegen-rs/Cargo.toml -- --check
+          python3 -m unittest discover -s tests -p 'test_kernel*.py'
+      - name: Build full-source submodule
+        run: |
+          headers="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"
+          test -n "$headers"
+          make -C "$headers" M="$GITHUB_WORKSPACE/submodules/tuxedo-drivers" -j2 modules
+          bash kernel/packaging/arch/check-module-deps.sh submodules/tuxedo-drivers "$(make -s -C "$headers" kernelrelease)"
